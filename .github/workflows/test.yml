@@ -30,8 +30,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pytest ${{ matrix.jax-version }} ${{ matrix.optax-version }} ${{ matrix.numpy-version }}
-          pip install -e .
+          pip install pytest -e . ${{ matrix.jax-version }} ${{ matrix.optax-version }} ${{ matrix.numpy-version }}
 
       - name: Display installed versions
         # Useful for debugging which versions actually got installed
