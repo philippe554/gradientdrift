@@ -31,12 +31,12 @@ jobs:
       - name: Install oldest dependencies
         if: matrix.dependencies == 'oldest'
         run: |
-          pip install -e . "jax==0.4.27" "jaxlib==0.4.27" "optax==0.2.4" "numpy==1.24.1"
+          pip install -e . "jax==0.4.34" "jaxlib==0.4.34" "optax==0.2.4" "numpy==1.24.1" pytest
 
       - name: Install latest dependencies
         if: matrix.dependencies == 'latest'
         run: |
-          pip install -e . jax jaxlib optax numpy
+          pip install -e . jax jaxlib optax numpy pytest
 
       - name: Display installed versions
         # Useful for debugging which versions actually got installed
