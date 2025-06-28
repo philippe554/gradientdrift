@@ -1,6 +1,6 @@
 import jax
 
-from .Model import Model
+from .model import Model
 
 class GARCH(Model):
     def __init__(self, p=1, q=1):

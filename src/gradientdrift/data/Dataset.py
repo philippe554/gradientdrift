@@ -1,5 +1,5 @@
 
-from .Batch import Batch
+from .batch import Batch
 
 class Dataset:
     def __init__(self, data):

@@ -1,7 +1,7 @@
 
 import jax
 
-from .Model import Model
+from .model import Model
 
 class VAR(Model):
     def __init__(self, numberOfLags=1, numberOfVariables=2):
