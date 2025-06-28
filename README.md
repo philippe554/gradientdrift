@@ -1,10 +1,10 @@
 
 # GradientDrift
 
-[](https://www.google.com/search?q=https://pypi.org/project/gradientdrift/)
-[](https://www.google.com/search?q=https://pypi.org/project/gradientdrift/)
-[](https://www.google.com/search?q=https://github.com/philippe554/gradientdrift/actions/workflows/test.yml)
-[](https://www.google.com/search?q=https://github.com/philippe554/gradientdrift/blob/main/LICENSE)
+![PyPI Version](https://img.shields.io/pypi/v/gradientdrift)
+![Python Versions](https://img.shields.io/pypi/pyversions/gradientdrift)
+![Tests](https://github.com/philippe554/gradientdrift/actions/workflows/ci.yml/badge.svg)
+![License](https://img.shields.io/pypi/l/gradientdrift)
 
 GradientDrift is a Python library for high-performance econometric time series analysis, specifically designed for datasets that are too large to fit into memory. It leverages the power of [JAX](https://github.com/google/jax) for hardware acceleration (CPU/GPU/TPU) and just-in-time (JIT) compilation of models.
 
