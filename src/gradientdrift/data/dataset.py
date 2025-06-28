@@ -1,8 +1,25 @@
 
+
+import jax
+import numpy as np
+
 from .batch import Batch
 
 class Dataset:
     def __init__(self, data):
+        try:
+            import pandas
+            if isinstance(data, pandas.DataFrame):
+                data = data.values
+        except ImportError:
+            pass
+
+        if isinstance(data, np.ndarray):
+            data = jax.numpy.array(data)
+        
+        if not isinstance(data, jax.numpy.ndarray):
+            raise TypeError("Data must be a numpy array or a pandas DataFrame.")
+
         self.data = data
         self.leftPadding = 0
         self.rightPadding = 0
