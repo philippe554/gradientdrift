@@ -14,9 +14,9 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
-        jax-version: ['jax==0.4.27 jaxlib==0.4.27', 'jax'] # without version is latest
-        optax-version: ['optax==0.2.4', 'optax']
-        numpy-version: ['numpy==1.24.1', 'numpy']
+        dependencies:
+          - 'oldest'
+          - 'latest'
 
     steps:
       - name: Checkout code
@@ -28,9 +28,15 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install oldest dependencies
+        if: matrix.dependencies == 'oldest'
         run: |
-          pip install pytest -e . ${{ matrix.jax-version }} ${{ matrix.optax-version }} ${{ matrix.numpy-version }}
+          pip install -e . "jax==0.4.27" "jaxlib==0.4.27" "optax==0.2.4" "numpy==1.24.1"
+
+      - name: Install latest dependencies
+        if: matrix.dependencies == 'latest'
+        run: |
+          pip install -e . jax jaxlib optax numpy
 
       - name: Display installed versions
         # Useful for debugging which versions actually got installed
