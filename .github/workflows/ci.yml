@@ -1,10 +1,12 @@
-name: Commit test
+name: Continuous Integration
 
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  schedule:
+    - cron: '0 3 1 * *'
 
 jobs:
   test:
