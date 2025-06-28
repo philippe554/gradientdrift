@@ -1,4 +1,4 @@
-name: Test
+name: Commit test
 
 on:
   push:
@@ -14,9 +14,12 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ['3.10', '3.11', '3.12', '3.13']
-        dependencies:
-          - 'oldest'
-          - 'latest'
+        dependency-set: ['2025', 'latest']
+        include:
+          - python-version: '3.10'
+            dependency-set: 'oldest'
+          - python-version: '3.11'
+            dependency-set: 'oldest'
 
     steps:
       - name: Checkout code
@@ -28,19 +31,27 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
 
-      - name: Install oldest dependencies
-        if: matrix.dependencies == 'oldest'
+      - name: Install "Oldest" Dependencies
+        if: matrix.dependency-set == 'oldest'
         run: |
           pip install -e . "jax==0.4.34" "jaxlib==0.4.34" "optax==0.2.4" "numpy==1.24.1" pytest
 
+      - name: Install dependencies from 2025
+        if: matrix.dependency-set == '2025'
+        run: |
+          pip install -e . "jax==0.6.2" "jaxlib==0.6.2" "optax==0.2.5" "numpy==2.2.6" pytest
+
       - name: Install latest dependencies
-        if: matrix.dependencies == 'latest'
+        if: matrix.dependency-set == 'latest'
         run: |
           pip install -e . jax jaxlib optax numpy pytest
 
       - name: Display installed versions
-        # Useful for debugging which versions actually got installed
-        run: pip freeze
+        run: |
+          echo "Python version: ${{ matrix.python-version }}"
+          echo "Dependency set: ${{ matrix.dependency-set }}"
+          echo "--------------------"
+          pip freeze
 
       - name: Run tests
         run: pytest
