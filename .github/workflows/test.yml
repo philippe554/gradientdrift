@@ -16,7 +16,7 @@ jobs:
         python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
         jax-version: ['jax==0.4.27', 'jax'] # without version is latest
         optax-version: ['optax==0.2.4', 'optax']
-        numpy-version: ['numpy==1.23.0', 'numpy']
+        numpy-version: ['numpy==1.24.1', 'numpy']
 
     steps:
       - name: Checkout code
