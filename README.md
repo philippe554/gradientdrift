@@ -47,11 +47,43 @@ data = gd.data.Dataset(pd.read_csv("test_data.csv"))
 # Use any of the models, the fit and summary syntax bellow will be equivalent
 model = gd.models.VAR(numberOfLags = numberOfLags, numberOfVariables = numberOfVariables)
 
-# Fit the model
+# Fit the model (default uses ADAM optimizer)
 model.fit(data, batchSize = 100)
 
 # Optionally, provide the data to the summary function, this will calculate the confidence interval (but can be expensive)
 model.summary(data)
+
+# Alternative optimizers:
+model.fit(data, optimizer="lbfgs")
+model.fit(data, optimizer="ClosedForm")
+```
+
+A GARCH example where we first simulate data using a model specification:
+
+```python
+# Define the true parameters of a model
+trueParams = {
+    'mu': 0.05,
+    'logOmega': jax.numpy.log(0.1),
+    'logAlpha': jax.numpy.log(0.1),
+    'logBeta': jax.numpy.log(0.85)
+}
+
+# Define a model
+generatorModel = gd.models.GARCH(p=1, q=1)
+generatorModel.setParameters(trueParams)
+initialValues = generatorModel.getInitialValues()
+
+# Simulate data
+simulatedData = generatorModel.simulate(initialValues, steps=1000000)
+
+# Put in a dataset container for batching
+data = gd.data.Dataset(simulatedData)
+
+# Fit the model
+model = gd.models.GARCH(p = 1, q = 1)
+model.fit(data)
+model.summary(data, trueParams = trueParams) # Provide true params to show in the coefficient table
 ```
 
 ## Contributing

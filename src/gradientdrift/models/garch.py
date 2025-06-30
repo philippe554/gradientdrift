@@ -11,6 +11,20 @@ class GARCH(Model):
         self.params = None
         self.effective_nobs = 0
 
+        self.params = {
+            'mu': 0.0,
+            'logOmega': jax.numpy.log(0.1),
+            'logAlpha': jax.numpy.log(0.1),
+            'logBeta': jax.numpy.log(0.8)
+        }
+
+        self.paramDims = {
+            'mu': [],
+            'logOmega': [],
+            'logAlpha': [],
+            'logBeta': []
+        }
+
     def requestPadding(self, dataset):
         dataset.setLeftPadding(100)
         dataset.setRightPadding(0)
@@ -36,8 +50,22 @@ class GARCH(Model):
         This function exists for API consistency. Forecasting volatility is more complex.
         """
         return jax.numpy.full_like(x, params['mu'])
+    
+    def getInitialValues(self):
+        trueOmega = jax.numpy.exp(self.params['logOmega'])
+        trueAlpha = jax.numpy.exp(self.params['logAlpha'])
+        trueBeta = jax.numpy.exp(self.params['logBeta'])
+        initialSigmaSq = trueOmega / (1 - trueAlpha - trueBeta)
+        initialY = self.params['mu']
 
-    def simulate(self, initialValues, steps, key):
+        initialValues = {
+            'initialY': self.params['mu'],
+            'initialSigmaSq': initialSigmaSq
+        }
+
+        return initialValues
+
+    def simulate(self, initialValues, steps, key = jax.random.PRNGKey(0)):
         """Simulates data from the GARCH process by adding a random error term."""
         
         def loop_body(carry, _):
