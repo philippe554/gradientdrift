@@ -1,6 +1,6 @@
 [project]
 name = "gradientdrift"
-version = "0.1.0"
+version = "0.2.0"
 description = "GradientDrift uses JAX to fit econometric models on datasets that do not fit in memory."
 readme = "README.md"
 license = "MIT"
