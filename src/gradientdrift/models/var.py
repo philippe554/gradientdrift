@@ -63,7 +63,11 @@ class VAR(Model):
 
         return yHat
     
-    def simulate(self, initialValues, steps, key):
+    def simulate(self, steps, initialValues = None, key = jax.random.PRNGKey(0)):
+
+        if initialValues is None:
+            initialValues = jax.numpy.zeros((self.numberOfLags, self.numberOfVariables))
+
         def loop_body(carry, _):
             last_p_values, currentKey = carry
             

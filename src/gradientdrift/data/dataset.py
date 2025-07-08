@@ -6,21 +6,30 @@ import numpy as np
 from .batch import Batch
 
 class Dataset:
-    def __init__(self, data):
+    def __init__(self, data, columns=None):
+        if columns is None:
+            raise ValueError("Columns must be provided for the dataset.")
+        
         try:
             import pandas
             if isinstance(data, pandas.DataFrame):
                 data = data.values
+                if columns is None:
+                    raise ValueError("Columns should not be provided for a pandas DataFrame.")
+                columns = data.columns
         except ImportError:
             pass
 
         if isinstance(data, np.ndarray):
             data = jax.numpy.array(data)
-        
+
+        data = data.reshape(-1, len(columns))
+
         if not isinstance(data, jax.numpy.ndarray):
             raise TypeError("Data must be a numpy array or a pandas DataFrame.")
 
         self.data = data
+        self.columns = columns               
         self.leftPadding = 0
         self.rightPadding = 0
         self.batches = []

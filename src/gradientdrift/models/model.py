@@ -4,6 +4,7 @@ import optax
 import numpy as np
 import datetime
 import re
+import jax.numpy as jnp
 
 class Model:
     def fitClosedForm(self, dataset, batchSize = 100):
@@ -28,10 +29,14 @@ class Model:
         # Prepare the optimization environment
         key = jax.random.PRNGKey(seed)
         key, subkey = jax.random.split(key)
-        self.setRandomParameters(subkey)        
+        self.setRandomParameters(subkey)      
+
+        print("Initial parameters:")
+        for name, param in self.params.items():
+            print(f"{name}: {param}")  
 
         if optimizer.lower() == "adam":
-            optimizerObj = optax.adam(0.01)
+            optimizerObj = optax.adam(0.1)
             optimizerUsesState = False
             self.fitConfig["Optimizer"] = "ADAM"
             self.fitConfig["Learning rate"] = 0.01
@@ -144,7 +149,7 @@ class Model:
                 else:
                     loss, grads = calcGradWithState(self.params, batch.data, optimizerState)
 
-                stepLoss += loss
+                stepLoss += loss * batch.getEffectiveNObs()
                 stepGrads = jax.tree_util.tree_map(jax.numpy.add, stepGrads, grads)
 
                 aggregatedLoss += loss
@@ -162,14 +167,14 @@ class Model:
 
             lossImprovement = abs(previousStepLoss - sampleLoss)
             previousStepLoss = sampleLoss
-            if lossImprovement < 1e-7:
+            if lossImprovement < 1e-9:
                 print("Convergence reached based on loss threshold.")
                 break
 
             stepGrads = jax.tree_util.tree_map(lambda g: g / numberOfBatches, stepGrads)
             grad_norm = jax.numpy.linalg.norm(jax.tree_util.tree_flatten(stepGrads)[0][0])
 
-            if grad_norm < 1e-5:
+            if grad_norm < 1e-7:
                 print("Convergence reached based on gradient norm.")
                 break
 
@@ -213,33 +218,41 @@ class Model:
         # Return both the Hessian and the function needed to unflatten the results
         return avg_hessian, unflatten_fn      
     
+    def setRandomParameters(self, key):
+        numberOfParameters = len(self.params)
+        keys = jax.random.split(key, numberOfParameters)
+        self.params = { name : jax.random.normal(key, jnp.shape(param)) * 0.1 for key, (name, param) in zip(keys, self.params.items()) }
+
     def getVariablePrettyName(self, variableName, indexList):
-        template = self.paramDims.get(variableName).copy()
+        if not hasattr(self, "paramDims") or variableName not in self.paramDims:
+            return variableName + "[" + ".".join(map(str, indexList)) + "]"
+        else:
+            template = self.paramDims.get(variableName).copy()
 
-        for i in range(len(indexList)):
-            def replacer(match):
-                offsetStr = match.group(1)
+            for i in range(len(indexList)):
+                def replacer(match):
+                    offsetStr = match.group(1)
+                    
+                    offset = 0
+                    if offsetStr:
+                        offset = int(offsetStr)
+
+                    try:
+                        baseValue = int(indexList[i])
+                        return str(baseValue + offset)
+                    except (ValueError, TypeError):
+                        if offset != 0:
+                            return match.group(0)
+                        else:
+                            return str(indexList[i])
+
+                pattern = r'\[i([+-]\d+)?\]'
                 
-                offset = 0
-                if offsetStr:
-                    offset = int(offsetStr)
-
-                try:
-                    baseValue = int(indexList[i])
-                    return str(baseValue + offset)
-                except (ValueError, TypeError):
-                    if offset != 0:
-                        return match.group(0)
-                    else:
-                        return str(indexList[i])
-
-            pattern = r'\[i([+-]\d+)?\]'
-            
-            if i < len(template):
-                template[i] = re.sub(pattern, replacer, template[i])
+                if i < len(template):
+                    template[i] = re.sub(pattern, replacer, template[i])
 
 
-        return variableName + "[" + ".".join(template) + "]"
+            return variableName + "[" + ".".join(template) + "]"
 
     def summary(self, dataset, trueParams = None):
         tableWidth = 104
@@ -279,10 +292,13 @@ class Model:
                 pValueSymbol = "***" if pValues[paramName][index] < 0.001 else "** " if pValues[paramName][index] < 0.01 else "*  " if pValues[paramName][index] < 0.05 else "   "
                 
                 if trueParams and paramName in trueParams:
-                    if type(trueParams[paramName]) in [int, float]:
-                        trueValue = f"{trueParams[paramName]:10.3f}"
-                    else:
-                        trueValue = f"{trueParams[paramName][index]:10.3f}"
+                    try:
+                        if np.shape(trueParams[paramName]) == ():
+                            trueValue = f"{trueParams[paramName]:10.3f}"
+                        else:
+                            trueValue = f"{trueParams[paramName][index]:10.3f}"
+                    except (IndexError, TypeError):
+                        trueValue = "N/A"
                 else:
                     trueValue = "N/A"
 

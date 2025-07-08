@@ -1,4 +1,6 @@
 import jax
+import jax.numpy as jnp
+import copy
 
 from .model import Model
 
@@ -26,23 +28,14 @@ class GARCH(Model):
         }
 
     def requestPadding(self, dataset):
-        dataset.setLeftPadding(100)
+        dataset.setLeftPadding(1)
         dataset.setRightPadding(0)
 
     def setParameters(self, params):
         if 'mu' not in params or 'logOmega' not in params or 'logAlpha' not in params or 'logBeta' not in params:
             raise ValueError("Parameters must contain 'mu', 'logOmega', 'logAlpha', and 'logBeta'.")
         
-        self.params = params
-
-    def setRandomParameters(self, key):
-        """Initializes unconstrained log-parameters with random values."""
-        self.params = {
-            'mu': jax.random.normal(key) * 0.1,
-            'logOmega': jax.numpy.log(0.1),
-            'logAlpha': jax.numpy.log(0.1),
-            'logBeta': jax.numpy.log(0.8)
-        }
+        self.params = copy.deepcopy(params)
 
     def predict(self, params, x):
         """
@@ -90,7 +83,7 @@ class GARCH(Model):
         _, all_simulations = jax.lax.scan(loop_body, initial_carry, None, length=steps)
         return all_simulations
 
-    def logLikelihood(self, params, data):
+    def loss(self, params, data):
         """Calculates the log-likelihood for a GARCH(1,1) model using scan."""
         self.effective_nobs = data.shape[0]
         
@@ -103,14 +96,15 @@ class GARCH(Model):
             prev_a_sq, prev_sigma_sq = carry
             current_sigma_sq = omega + alpha * prev_a_sq + beta * prev_sigma_sq
             a_t = y_t - mu
-            new_carry = (a_t**2, current_sigma_sq)
+            new_carry = (a_t * a_t, current_sigma_sq)
             return new_carry, current_sigma_sq
 
         # Initialize with unconditional variance
-        uncond_var = omega / (1 - alpha - beta)
-        initial_carry = (uncond_var, uncond_var)
+        y_0 = jnp.reshape((data[0, 0] - mu) * (data[0, 0] - mu), (1,))  # Squared residual for the first observation
+        uncond_var = jnp.reshape(omega / (1 - alpha - beta), (1,))
+        initial_carry = (y_0, uncond_var)
         
-        _, sigma_sq_series = jax.lax.scan(volatility_step, initial_carry, data)
+        _, sigma_sq_series = jax.lax.scan(volatility_step, initial_carry, data[1:,:])
         
-        logLikelihoods = jax.scipy.stats.norm.logpdf(data, loc=mu, scale=jax.numpy.sqrt(sigma_sq_series))
-        return jax.numpy.mean(logLikelihoods)
+        logLikelihoods = jax.scipy.stats.norm.logpdf(data[1:,:], loc=mu, scale=jax.numpy.sqrt(sigma_sq_series))
+        return -jax.numpy.mean(logLikelihoods)
