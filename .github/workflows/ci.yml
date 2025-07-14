@@ -41,7 +41,7 @@ jobs:
       - name: Install dependencies from 2025
         if: matrix.dependency-set == '2025'
         run: |
-          pip install -e . "jax==0.6.2" "jaxlib==0.6.2" "optax==0.2.5" "numpy==2.2.6" "scipy==1.16.0" "lark==1.2.2" pytest
+          pip install -e . "jax==0.6.2" "jaxlib==0.6.2" "optax==0.2.5" "numpy==2.2.6" "scipy==1.15.3" "lark==1.2.2" pytest
 
       - name: Install latest dependencies
         if: matrix.dependency-set == 'latest'
