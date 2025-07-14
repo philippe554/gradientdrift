@@ -20,6 +20,7 @@ class Universal(Model):
         statements = formulaTree.children
         parameterDefinition = [{"tokens" : s} for s in statements if s.data == 'parameterdefinition']
         constraintDefinitions = [{"tokens" : s} for s in statements if s.data == 'constraint']
+        self.initializations = [{"tokens" : s} for s in statements if s.data == 'initialization']
         self.assignments = [{"tokens" : s} for s in statements if s.data == 'assignment']
         self.formulas = [{"tokens" : s} for s in statements if s.data == 'formula']
         self.optimize = [{"tokens" : s} for s in statements if s.data == 'optimize']
@@ -79,7 +80,13 @@ class Universal(Model):
                     raise ValueError(f"Bound constraint must have exactly 3 children: left-hand side, operator, and right-hand side. Found {len(constraintTokens)} children.")
             else:
                 raise ValueError(f"Unsupported constraint type '{constraint['tokens'].data}'. Supported types are 'boundconstraint' and 'sumconstraint'.")
-            
+
+        # Process initializations (order independent, evaluated in the forward pass)
+        for i, initialization in enumerate(self.initializations):
+            initialization["name"] = initialization["tokens"].children[0].value
+            initialization["index"] = int(initialization["tokens"].children[1].value)
+            initialization["value"] = initialization["tokens"].children[2]
+
         # Process assignments
         for i, assignment in enumerate(self.assignments):
             lhs, rhs = assignment["tokens"].children
@@ -251,6 +258,18 @@ class Universal(Model):
 
         if self.leftPadding > 0:
             states = {assignment["name"] : jnp.zeros((dataLength, 1)) for assignment in self.assignments}
+            
+            for name in self.initializations:
+                parameterName = name["name"]
+                index = name["index"]
+                valueGetter = GetValueFromData(
+                    params = params, constants = self.parameterConstants, parameterizations = self.parameterizations)
+                initialValue = valueGetter.transform(name["value"])
+                if parameterName in states:
+                    states[parameterName] = states[parameterName].at[index, :].set(initialValue)
+                else:
+                    raise ValueError(f"Initialization parameter '{parameterName}' not found in assignments. Please ensure the parameter is defined in the formula.")
+            
             responses = {i: jnp.zeros((dataLength, len(formula["dependingVariables"]))) for i, formula in enumerate(self.formulas)}
             initialCarry = (states, responses)
 

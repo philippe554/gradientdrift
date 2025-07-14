@@ -5,10 +5,11 @@ formulaGrammar = r"""
 
     model: NEWLINE* statement (NEWLINE+ (statement))* NEWLINE*
     
-    ?statement: (formula | assignment | optimize | parameterdefinition | constraint)
+    ?statement: (formula | initialization | assignment | optimize | parameterdefinition | constraint)
 
     formula: dependingvariables "~" NEWLINE* sum
 
+    initialization: NAME "[" NEWLINE* NUMBER NEWLINE* "]" "=" NEWLINE* sum
     assignment: NAME "=" NEWLINE* sum
     
     parameterdefinition: parameterlist (PARAMETERDEFINITIONOPERATOR NEWLINE* (sum | shape))+
