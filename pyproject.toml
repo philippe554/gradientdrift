@@ -13,6 +13,8 @@ dependencies = [
     "jax>=0.4.34",
     "optax>=0.2.4",
     "numpy>=1.24.1",
+    "scipy>=1.10.1",
+    "lark>=1.1.5"
 ]
 
 classifiers = [
