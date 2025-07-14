@@ -10,6 +10,9 @@ from gradientdrift.utils.formulaparsers import ModelFormulaParser, ModelFormulaR
 
 class Universal(Model):
     def __init__(self, formula):
+        self.constructModel(formula)
+
+    def constructModel(self, formula):
         # Tokenize the formula
         formulaTree = ModelFormulaParser.parse(formula)
         formulaTree = RemoveNewlines().transform(formulaTree)
@@ -67,9 +70,8 @@ class Universal(Model):
                         parameters = GetParameters().transform(right)
                         for parameter in parameters:
                             self.parameterizations[parameter] = {
-                                "type": "bounds",
-                                "bounds": [value, None],
-                                "parameters": [parameter]
+                                "unconstraintParameterNames": [parameter],
+                                "apply": lambda p: jax.nn.softplus(p) + value
                             }
                     else:
                         raise ValueError(f"Right-hand side of bound constraint must be a parameter list. Found: {right.data}.")
@@ -219,6 +221,8 @@ class Universal(Model):
                                [assignment["leftPadding"] for assignment in self.assignments])
         self.rightPadding = max([formula["rightPadding"] for formula in self.formulas] + 
                                 [assignment["rightPadding"] for assignment in self.assignments])
+        
+        super().constructModel()
 
     def requestPadding(self, dataset):
         dataset.setLeftPadding(self.leftPadding)

@@ -32,15 +32,11 @@ class Model:
         key, subkey = jax.random.split(key)
         self.setRandomParameters(subkey)      
 
-        print("Initial parameters:")
-        for name, param in self.parameterValues.items():
-            print(f"{name}: {param}")  
-
         if optimizer.lower() == "adam":
             optimizerObj = optax.adam(0.1)
             optimizerUsesState = False
             self.fitConfig["Optimizer"] = "ADAM"
-            self.fitConfig["Learning rate"] = 0.01
+            self.fitConfig["Learning rate"] = 0.1
 
         elif optimizer.lower() == "lbfgs":
             optimizerObj = optax.lbfgs()
@@ -168,7 +164,7 @@ class Model:
 
             lossImprovement = abs(previousStepLoss - sampleLoss)
             previousStepLoss = sampleLoss
-            if lossImprovement < 1e-9:
+            if lossImprovement < 1e-7:
                 print("Convergence reached based on loss threshold.")
                 break
 
@@ -190,45 +186,43 @@ class Model:
         self.fitConfig["Fit duration"] = str(fitEndTime - fitStartTime)
 
     def loss(self, params, data):
-        return -self.logLikelihood(params, data)
+        raise NotImplementedError("This method should be implemented in subclasses.")
     
-    def hessian(self, params, dataset):
-        # Use JAX's built-in utility to flatten the pytree and get an un-flattening function.
-        # This is much safer than doing it manually.
-        flat_params, unflatten_fn = jax.flatten_util.ravel_pytree(params)
-
-        hessian_for_batch = jax.jit(jax.hessian(lambda p, d: self.loss(unflatten_fn(p), d)))
-        
-        # Use jax.vmap to create a function that computes the gradient for each
-        # observation in a batch and stacks them into a matrix.
-        # in_axes=(None, 0) means we don't map over params, but we do map over data.    
-        jacobian_for_batch  = jax.jit(
-            jax.jacfwd(lambda p, d: self.loss(unflatten_fn(p), d, returnLossPerSample = True))
+    def constructModel(self):
+        _, self.unflattenFunc = jax.flatten_util.ravel_pytree(self.parameterValues)
+    
+    def flattenParameters(self, parameters):
+        parametersFlat, _ = jax.flatten_util.ravel_pytree(parameters)
+        return parametersFlat
+    
+    def unflattenParameters(self, parametersFlat):
+        return self.unflattenFunc(parametersFlat)
+    
+    def calculateHessianAndOPGMatrix(self, params, dataset):
+        hessianFunc = jax.jit(
+            jax.hessian(
+                lambda p, d: self.loss(self.unflattenParameters(p), d)
+            )
+        )
+        jacobianFunc = jax.jit(
+            jax.jacfwd(
+                lambda p, d: self.loss(self.unflattenParameters(p), d, returnLossPerSample = True)
+            )
         )
 
-        # --- Aggregation loop ---
-        # (This part remains the same)
-        aggregatedHessian = jax.numpy.zeros((flat_params.size, flat_params.size))
-        opg_sum = jax.numpy.zeros((flat_params.size, flat_params.size))
+        parametersFlat = self.flattenParameters(params)
+        hessianSum = jax.numpy.zeros((parametersFlat.size, parametersFlat.size))
+        OPGSum = jax.numpy.zeros((parametersFlat.size, parametersFlat.size))
         numberOfBatches = dataset.getNumberOfBatches()
-        effectiveEntriesPerBatch = 4999
+        
         for i in range(numberOfBatches):
-            batch_data = dataset.getBatch(i).data
-            batchHessian = hessian_for_batch(flat_params, batch_data)
-            aggregatedHessian += batchHessian
+            data = dataset.getBatch(i).data
+            hessianSum += hessianFunc(parametersFlat, data)
+            OPGBatch = jacobianFunc(parametersFlat, data)
+            OPGSum += OPGBatch.T @ OPGBatch
 
-            # 2. Aggregate the Outer-Product-of-Gradients
-            # Get the gradient for EACH observation in the batch (returns a matrix)
-            per_obs_gradients = jacobian_for_batch (flat_params, batch_data)
-            if jnp.shape(per_obs_gradients) != (effectiveEntriesPerBatch, flat_params.size):
-                raise ValueError(f"Expected per_obs_gradients to have shape ({effectiveEntriesPerBatch}, {flat_params.size}), but got {jnp.shape(per_obs_gradients)}. This might indicate a mismatch in the number of observations or parameters.")
-            # The sum of outer products for the batch is g.T @ g
-            opg_sum += per_obs_gradients.T @ per_obs_gradients
-
-        avg_hessian = aggregatedHessian / numberOfBatches
-
-        # Return both the Hessian and the function needed to unflatten the results
-        return avg_hessian, opg_sum, unflatten_fn      
+        hessian = hessianSum / numberOfBatches
+        return hessian, OPGSum      
     
     def setRandomParameters(self, key):
         numberOfParameters = len(self.parameterValues)
@@ -267,6 +261,8 @@ class Model:
             return variableName + "[" + ".".join(template) + "]"
 
     def summary(self, dataset, trueParams = None):
+        standardErrors = self.getStdErrs(dataset)
+        
         tableWidth = 104
 
         print("=" * tableWidth)
@@ -277,7 +273,7 @@ class Model:
         print(f"{'Fit date:':<20.20}{str(self.getFitDate()):<32.32}{' LL:':<20.20}{str(self.getLogLikelihood(dataset)):<32.32}")
         print(f"{'Fit time:':<20.20}{str(self.getFitTime()):<32.32}{' AIC:':<20.20}{str(self.getAIC(dataset)):<32.32}")
         print(f"{'No. obs.:':<20.20}{str(self.getObsCount(dataset)):<32.32}{' BIC:':<20.20}{str(self.getBIC(dataset)):<32.32}")
-        print(f"{'Std. err. method:':<20.20}{'Robust':<32.32}")
+        print(f"{'Covariance est.:':<20.20}{'Robust':<32.32}")
 
         print("=" * tableWidth)
         print("Fit configuration")
@@ -289,21 +285,15 @@ class Model:
         print("=" * tableWidth)
         print("Parameter estimates")
         print("-" * tableWidth)
-        print(f"{'Parameter':<28.28} {'Estimate':>10.10} {'Std. err.':>10.10} {'Z-stat.':>10.10} {'P-value':>9.9} {'Conf. interval':>21.21} {'True val':>10.10}")
+        print(f"{'Parameter':<28.28} {'Estimate':>10.10} {'Std. err.':>10.10} {'t-stat.':>10.10} {'P-value':>9.9} {'Conf. interval':>21.21} {'True val':>10.10}")
 
-        stdErrs = self.getStdErrs(dataset)
-        zStats = self.getZStats(dataset)
-        pValues = self.getPValues(dataset)
-        lowerBounds, upperBounds = self.getConfIntervals(dataset)
+        estimates = self.getConstraintParameters()
+        tStats = self.getTStats(dataset, standardErrors = standardErrors)
+        pValues = self.getPValues(dataset, standardErrors = standardErrors)
+        lowerBounds, upperBounds = self.getConfIntervals(dataset, standardErrors = standardErrors)
 
-        for paramName in self.parameterValues:
-            paramArray = self.parameterValues[paramName]
-
+        for paramName, paramArray in estimates.items():
             for index, estimate in np.ndenumerate(paramArray):
-
-                if hasattr(self, "parameterizations") and paramName in self.parameterizations:
-                    estimate = jax.nn.softplus(estimate)
-
                 paramPrettyName = self.getVariablePrettyName(paramName, index)
                 confInterval = f"{lowerBounds[paramName][index]:10.3f};{upperBounds[paramName][index]:10.3f}"
                 pValueSymbol = "***" if pValues[paramName][index] < 0.001 else "** " if pValues[paramName][index] < 0.01 else "*  " if pValues[paramName][index] < 0.05 else "   "
@@ -319,12 +309,9 @@ class Model:
                 else:
                     trueValue = "N/A"
 
-                print(f"{paramPrettyName:<28.28} {estimate:>10.3f} {stdErrs[paramName][index]:>10.5f} {zStats[paramName][index]:>10.3f} {pValues[paramName][index]:>6.3f}{pValueSymbol} {confInterval:>21.21} {trueValue:>10.10}")
+                print(f"{paramPrettyName:<28.28} {estimate:>10.3f} {standardErrors[paramName][index]:>10.5f} {tStats[paramName][index]:>10.3f} {pValues[paramName][index]:>6.3f}{pValueSymbol} {confInterval:>21.21} {trueValue:>10.10}")
         print(" " * 31 + "P-value symbols: *** for p < 0.001, ** for p < 0.01, * for p < 0.05")
-        print("=" * tableWidth)
-        
-
-        
+        print("=" * tableWidth)      
     
     def getModelType(self):
         return "<TBD>"
@@ -346,133 +333,97 @@ class Model:
 
     def getBIC(self, dataset):
         return "<TBD>"
-
-    def getCoefs(self):
-        return self.parameterValues
     
-    def getTrueParams(self):
-        return {
-            'mu': self.parameterValues['mu'],
-            'omega': jax.nn.softplus(self.parameterValues['omega']),
-            'alpha': jax.nn.softplus(self.parameterValues['alpha']),
-            'beta': jax.nn.softplus(self.parameterValues['beta'])
-        }
+    def applyParameterization(self, params):
+        if not hasattr(self, "parameterizations"):
+            return params
+        else:
+            constraintParams = {}
+            for name, value in params.items():
+                if name in self.parameterizations:
+                    unconstrainedParamNames = self.parameterizations[name]["unconstraintParameterNames"]
+                    unconstrainedParams = [params[unconstrainedParamName] for unconstrainedParamName in unconstrainedParamNames]
+                    constraintParams[name] = self.parameterizations[name]["apply"](*unconstrainedParams)
+                else:
+                    constraintParams[name] = value
+            return constraintParams
+    
+    def getConstraintParameters(self):
+        return self.applyParameterization(self.parameterValues)
+        
+    def getDegreesOfFreedom(self, dataset):
+        nObs = dataset.getEffectiveNObs()
+        nParams = self.flattenParameters(self.parameterValues).size
+        return nObs - nParams
     
     def getStdErrs(self, dataset):
-        """
-        Calculates the standard errors of the model parameters using the robust
-        ravel_pytree utility to prevent ordering bugs.
-        """
-        # Get both the Hessian and the unflattening function
-        hessianOfMean, opg_matrix, unflatten_fn = self.hessian(self.parameterValues, dataset)
-        
-        if hessianOfMean is None: # Handle potential failure in hessian calculation
-            return jax.tree_util.tree_map(lambda p: jax.numpy.full_like(p, jax.numpy.nan), self.parameterValues)
-
-        # Scale to get the Hessian of the sum
-        hessianOfSum = hessianOfMean * dataset.getEffectiveNObs()
-        
         try:
-            invHessian = jax.numpy.linalg.inv(hessianOfSum)
+            # Calculate the Hessian and OPG matrix
+            hessian, OPGMatrix = self.calculateHessianAndOPGMatrix(self.parameterValues, dataset)
+            hessian *= dataset.getEffectiveNObs()
+        
+            # Calculate the inverse of the Hessian
+            invHessian = jax.numpy.linalg.inv(hessian)
 
-            # covMatrix = invHessian
-            robustCovMatrix = invHessian @ opg_matrix @ invHessian
+            # Calculate the robust covariance matrix
+            robustCovMatrix = invHessian @ OPGMatrix @ invHessian
 
-            # APPLY FINITE SAMPLE CORRECTION
-            correction_factor = dataset.getEffectiveNObs() / (dataset.getEffectiveNObs() - len(self.parameterValues))
-            robustCovMatrix *= correction_factor
+            # Apply the correction factor for the number of observations
+            N = dataset.getEffectiveNObs()
+            dof = self.getDegreesOfFreedom(dataset)
+            correctionFactor = N / dof
+            robustCovMatrix *= correctionFactor
 
-            ### Correct for parameterization
+            # Correct for parameterization
+            def helper(parametersFlat):
+                params = self.unflattenParameters(parametersFlat)
+                p = self.applyParameterization(params)
+                return self.flattenParameters(p)
+            jacobianFunc = jax.jacfwd(helper)
+            parametersFlat = self.flattenParameters(self.parameterValues)
+            jacobian = jacobianFunc(parametersFlat)
+            robustCovMatrix = jacobian.T @ robustCovMatrix @ jacobian
 
-            paramsFlat, unravelFunc = jax.flatten_util.ravel_pytree(self.parameterValues)
-
-            def getTrueParamsFlat(paramsFlat):
-                params = unravelFunc(paramsFlat)
-
-                p = {
-                    'mu': params['mu'],
-                    'omega': jax.nn.softplus(params['omega']),
-                    'alpha': jax.nn.softplus(params['alpha']),
-                    'beta': jax.nn.softplus(params['beta'])
-                }
-
-                return jax.flatten_util.ravel_pytree(p)[0]
-            
-            jacobian = jax.jacfwd(getTrueParamsFlat)(paramsFlat)
-
-            robustCovMatrix = jacobian @ robustCovMatrix @ jacobian.T
-
-            ###
-
+            # Flatten the covariance matrix to get standard errors
             stdErrorsFlat = jax.numpy.sqrt(jax.numpy.diag(robustCovMatrix))
             
-            # Use the unflattening function to safely convert the flat vector
-            # back into the correct PyTree structure. No manual reshaping!
-            stdErrorsPytree = unflatten_fn(stdErrorsFlat)
-            
-            return stdErrorsPytree
+            # Unflatten the standard errors to match the structure of the parameters
+            return self.unflattenParameters(stdErrorsFlat)
             
         except jax.numpy.linalg.LinAlgError:
             print("Warning: Hessian is not invertible. Standard errors cannot be computed.")
-            return jax.tree_util.tree_map(lambda p: jax.numpy.full_like(p, jax.numpy.nan), self.parameterValues)
+            exit(1)
         
-    def getZStats(self, dataset):
-        """
-        Calculates the z-statistics for each parameter (estimate / std_err).
-        """
-        estimates = self.getTrueParams()
-        std_errs = self.getStdErrs(dataset)
+    def getTStats(self, dataset, standardErrors = None):
+        estimates = self.getConstraintParameters()
+        if standardErrors is None:
+            standardErrors = self.getStdErrs(dataset)
         
-        # jax.tree_map can operate on multiple pytrees with the same structure
-        # It will pass the corresponding leaf from each tree to the lambda function.
-        z_stats = jax.tree_util.tree_map(
-            lambda estimate, se: estimate / se, 
-            estimates, 
-            std_errs
-        )
-        return z_stats
+        return jax.tree_util.tree_map(lambda estimate, se: estimate / se, estimates, standardErrors)
 
-    def getPValues(self, dataset):
-        """
-        Calculates the two-tailed p-values for the z-statistics.
-        """
-        z_stats = self.getZStats(dataset)
-        
-        # The p-value for a two-tailed test is 2 * (1 - CDF(|z|)).
-        # JAX's survival function `norm.sf` is 1 - CDF, so this is 2 * norm.sf(|z|).
-        # p_values = jax.tree_util.tree_map(
-        #     lambda z: 2 * jax.scipy.stats.norm.sf(jax.numpy.abs(z)),
-        #     z_stats
-        # )
+    def getPValues(self, dataset, standardErrors = None):
+        tStat = self.getTStats(dataset, standardErrors = standardErrors)
+        dof = self.getDegreesOfFreedom(dataset)
 
+        # TODO: check this function
         def t_sf(t, df):
             x = df / (df + t**2)
             a = df / 2.0
             b = 0.5
             return 0.5 * jax.scipy.special.betainc(a, b, x)
 
-        t_stats = z_stats
-        degrees_of_freedom = dataset.getEffectiveNObs() - len(self.parameterValues)
+        return jax.tree_util.tree_map(lambda tStat: 2 * t_sf(jnp.abs(tStat), df = dof), tStat)
 
-        p_values = jax.tree_util.tree_map(
-            lambda t_stat: 2 * t_sf(jnp.abs(t_stat), df=degrees_of_freedom),
-            t_stats
-        )
-
-
-        return p_values
-
-    def getConfIntervals(self, dataset):
-        estimates = self.getTrueParams()
-        std_errs = self.getStdErrs(dataset)        
+    def getConfIntervals(self, dataset, standardErrors = None):
+        estimates = self.getConstraintParameters()
+        if standardErrors is None:
+            standardErrors = self.getStdErrs(dataset)
+                
+        dof = self.getDegreesOfFreedom(dataset)
+        criticalValue = scipy.stats.t.ppf(0.975, df = dof)
         
-        # critical_value = 1.96 # z critical value for 95% CI, assuming normal distribution
-        
-        degrees_of_freedom = dataset.getEffectiveNObs() - len(self.parameterValues)
-        critical_value = scipy.stats.t.ppf(0.975, df=degrees_of_freedom) # t critical value for 95% CI, using degrees of freedom from the dataset
-        
-        lowerBound = jax.tree_util.tree_map(lambda estimate, se: estimate - critical_value * se, estimates, std_errs)
-        upperBound = jax.tree_util.tree_map(lambda estimate, se: estimate + critical_value * se, estimates, std_errs)
+        lowerBound = jax.tree_util.tree_map(lambda estimate, se: estimate - criticalValue * se, estimates, standardErrors)
+        upperBound = jax.tree_util.tree_map(lambda estimate, se: estimate + criticalValue * se, estimates, standardErrors)
         return lowerBound, upperBound
 
     def getLjungBoxStat(self, dataset):
@@ -492,48 +443,3 @@ class Model:
         
     def isStationary(self):
         return "<TBD>"
-        
-    def summary_old(self, batch, trueParams=None):
-        print("\n--- Model Summary ---")
-        stdErrors = self.stdError(self.parameterValues, batch)
-        if stdErrors is None:
-            print("Summary could not be generated as standard errors could not be computed.")
-            return
-
-        # Prepare table header
-        header_items = ["Parameter", "Estimate", "Std. Error"]
-        header_format = "{:<20} {:>12} {:>12}"
-        if trueParams:
-            header_items.insert(1, "True Value")
-            header_format += " {:>12}"
-        
-        # Print Header
-        print(header_format.format(*header_items))
-        print("-" * (len(header_format.format(*header_items)) + 2))
-
-        # Iterate through all parameters in the pytree (e.g., 'coeffs', 'const')
-        for key in self.parameterValues:
-            param_array = self.parameterValues[key]
-            se_array = stdErrors[key]
-            true_array = trueParams.get(key) if trueParams is not None else None
-
-            # Use ndenumerate to handle any parameter shape (scalar, vector, matrix, etc.)
-            for index, estimate in np.ndenumerate(param_array):
-                # Create a readable parameter name like "coeffs[0,0,0]"
-                param_name = f"{key}{list(index)}"
-                se = se_array[index]
-                
-                row_items = [param_name, f"{estimate:.4f}", f"{se:.4f}"]
-                
-                if true_array is not None:
-                    # Check if the true parameter for this key exists before accessing
-                    try:
-                        true_val = true_array[index]
-                        row_items.insert(1, f"{true_val:.4f}")
-                    except (TypeError, IndexError):
-                         # Handle cases where true_val is not subscriptable (e.g. for logSigma)
-                        row_items.insert(1, "N/A")
-
-                print(header_format.format(*row_items))
-
-        # TODO: calc AIC and BIC, question: should the sigma be included in the AIC/BIC calculation?

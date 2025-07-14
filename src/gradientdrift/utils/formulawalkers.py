@@ -370,21 +370,9 @@ class GetValueFromData(Transformer):
                 if self.parameterizations is None:
                     raise ValueError("Parameterizations are not defined. Please ensure parameterizations are set for the model.")
                 if parameterName in self.parameterizations:
-                    type = self.parameterizations[parameterName]["type"]
-                    parameterizationParams = self.parameterizations[parameterName]["parameters"]
-                    if type == "bounds":
-                        parameterName = parameterizationParams[0]
-                        bounds = self.parameterizations[parameterName]["bounds"]
-                        if bounds[0] is not None and bounds[1] is not None: # full bounds
-                            return jax.nn.sigmoid(self.params[parameterName]) * (bounds[1] - bounds[0]) + bounds[0]
-                        elif bounds[0] is not None: # lower bound only
-                            return jax.nn.softplus(self.params[parameterName]) + bounds[0]
-                        elif bounds[1] is not None: # upper bound only
-                            return -jax.nn.softplus(self.params[parameterName]) + bounds[1]
-                        else: # no bounds
-                            raise ValueError(f"Parameter '{parameterName}' has no bounds defined. Please ensure bounds are set for the parameter.")
-                    else:
-                        raise ValueError(f"Unknown parameterization type: {type}. Supported types are 'bounds'.")
+                    unconstrainedParamNames = self.parameterizations[parameterName]["unconstraintParameterNames"]
+                    unconstrainedParams = [self.params[unconstrainedParamName] for unconstrainedParamName in unconstrainedParamNames]
+                    return self.parameterizations[parameterName]["apply"](*unconstrainedParams)
                 else:
                     return self.params[parameterName]
             elif self.constants and parameterName in self.constants:
