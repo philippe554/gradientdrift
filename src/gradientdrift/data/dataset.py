@@ -48,7 +48,7 @@ class Dataset:
     
     def prepareBatches(self, batchSize):
         if batchSize == -1:
-            self.batches = [Batch(self.data)]
+            self.batches = [Batch(self.data, self.leftPadding, self.rightPadding)]
         else:
             start = self.leftPadding
             end = self.data.shape[0] - self.rightPadding
@@ -58,7 +58,7 @@ class Dataset:
                 batchStart = i - self.leftPadding
                 batchEnd = min(i + batchSize, end) + self.rightPadding
                 batchData = self.data[batchStart:batchEnd]
-                batch = Batch(batchData)
+                batch = Batch(batchData, self.leftPadding, self.rightPadding)
                 self.batches.append(batch)
                 
     def getNumberOfBatches(self):

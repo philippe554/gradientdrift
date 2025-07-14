@@ -10,13 +10,13 @@ from jax import lax
 import jax
 
 from gradientdrift.utils.formulaparsers import ModelFormulaReconstructor
-from gradientdrift.utils.functionmap import getFunctionMap
+from gradientdrift.utils.functionmap import getFunctionMap, requiresRandomKey
 
 # Extract all functions from jax, jax.numpy, and jax.scipy
 
 functionMap = getFunctionMap()
 
-def getCoefficientName(tree):
+def getParameterName(tree):
     name = ModelFormulaReconstructor.reconstruct(copy.deepcopy(tree))
     s = re.sub(r'[^a-zA-Z0-9_]+', '_', name)
     return s.strip('_')
@@ -32,7 +32,7 @@ class GetDataFields(Transformer):
         return set().union(*children)
     def variable(self, items): return {items[0].value}
     def number(self, items): return set()
-    def coefficient(self, items): return set()
+    def parameter(self, items): return set()
     @v_args(inline = True)
     def funccall(self, name, args=None):
         return args if args is not None else set()
@@ -86,20 +86,20 @@ class GetMaxLag(Transformer):
     @v_args(meta = True)
     def variable(self, meta, children): return meta.lag
     def number(self, children): return 0
-    def coefficient(self, children): return 0
+    def parameter(self, children): return 0
     def operator(self, children): return 0
     @v_args(inline = True, meta = True)
     def funccall(self, meta, name, args=None):
         funcLag = meta.lag if hasattr(meta, 'lag') else 0
         return max(funcLag, args)
         
-class GetCoefficients(Transformer):
+class GetParameters(Transformer):
     """A transformer to find all unique column names required by a formula."""
     def __default__(self, data, children, meta):
         return [item for sublist in children for item in sublist]
     def variable(self, items): return []
     def number(self, items): return []
-    def coefficient(self, items): return [items[0].value] if items else []
+    def parameter(self, items): return [items[0].value] if items else []
     def operator(self, items): return []
     @v_args(inline = True)
     def funccall(self, name, args=None):
@@ -111,41 +111,41 @@ class LabelOuterSum(Interpreter):
     def sum(self, meta, children):
         meta.outerSum = True
 
-class NameUnnamedCoefficients(Transformer):
-    def __init__(self, existingCoefficients):
+class NameUnnamedParameters(Transformer):
+    def __init__(self, existingParameters):
         super().__init__()
-        self.existingCoefficients = set(existingCoefficients)
+        self.existingParameters = set(existingParameters)
 
     def __default__(self, data, children, meta):
         unnamedIndices = [i for i, tree in enumerate(children) if 
-            isinstance(tree, Tree) and tree.data == 'coefficient' and len(tree.children) == 0]
+            isinstance(tree, Tree) and tree.data == 'parameter' and len(tree.children) == 0]
         
         if len(unnamedIndices) == 0:
             return Tree(data, children, meta)
         elif len(unnamedIndices) > 1:
-            raise ValueError("Multiple unnamed coefficients found at the same level. Please ensure each coefficient is uniquely named.")
+            raise ValueError("Multiple unnamed parameters found at the same level. Please ensure each parameter is uniquely named.")
         else:
-            if unnamedIndices[0] == 0: # coefficient is the first child
-                otherChildren = children[2:] # skip the coefficient and the operator after it
-            else: # coefficient is not the first child
-                otherChildren = children[:unnamedIndices[0] - 1] + children[unnamedIndices[0] + 1:] # skip the coefficient and the operator before it
+            if unnamedIndices[0] == 0: # parameter is the first child
+                otherChildren = children[2:] # skip the parameter and the operator after it
+            else: # parameter is not the first child
+                otherChildren = children[:unnamedIndices[0] - 1] + children[unnamedIndices[0] + 1:] # skip the parameter and the operator before it
             
             if len(otherChildren) == 0 or len(otherChildren) != len(children) - 2:
                 raise ValueError("Unexpected structure in children. Please ensure the formula is correctly structured.")
             otherTree = Tree(data, otherChildren, meta)
-            coefficientName = getCoefficientName(otherTree)
+            parameterName = getParameterName(otherTree)
             
-            if coefficientName in self.existingCoefficients:
-                raise ValueError(f"Coefficient name '{coefficientName}' already exists. Please ensure all coefficients have unique names.")
-            self.existingCoefficients.add(coefficientName)
+            if parameterName in self.existingParameters:
+                raise ValueError(f"Parameter name '{parameterName}' already exists. Please ensure all parameters have unique names.")
+            self.existingParameters.add(parameterName)
             
-            children[unnamedIndices[0]] = Tree("coefficient", [Token('NAME', coefficientName)], meta)
+            children[unnamedIndices[0]] = Tree("parameter", [Token('NAME', parameterName)], meta)
             return Tree(data, children, meta)
 
-class InsertCoefficients(Transformer):
+class InsertParameters(Transformer):
     """
     "Compiles" a formula by ensuring every term in the RHS summation is
-    explicitly multiplied by a named coefficient.
+    explicitly multiplied by a named parameter.
     """
 
     @v_args(meta = True)
@@ -154,11 +154,11 @@ class InsertCoefficients(Transformer):
             insertedItems = []
             for i in range(len(children)):
                 if i % 2 == 0:
-                    coefficientName = getCoefficientName(children[i])
+                    parameterName = getParameterName(children[i])
 
-                    coefficient = Tree(
-                        Token('RULE', 'coefficient'), [
-                            Token('NAME', coefficientName)
+                    parameter = Tree(
+                        Token('RULE', 'parameter'), [
+                            Token('NAME', parameterName)
                         ],
                         meta
                     )
@@ -170,7 +170,7 @@ class InsertCoefficients(Transformer):
                         meta
                     )
 
-                    insertedItems.append(Tree("product", [coefficient, operator, children[i]], meta))
+                    insertedItems.append(Tree("product", [parameter, operator, children[i]], meta))
                 else:
                     if children[i].data == 'operator':
                         insertedItems.append(children[i])
@@ -182,16 +182,16 @@ class InsertCoefficients(Transformer):
             return Tree("sum", children, meta)
         
     @v_args(meta = True)
-    def coefficient(self, meta, children):
+    def parameter(self, meta, children):
         if children:
-            return Tree("coefficient", children, meta)
+            return Tree("parameter", children, meta)
         else:
-            raise ValueError("Unnamed coefficient found. Please ensure all coefficients are named.")
+            raise ValueError("Unnamed parameter found. Please ensure all parameters are named.")
 
-class GetCoefficientShapes(Transformer):
+class GetParameterShapes(Transformer):
     def __init__(self, outputLength):
         super().__init__()
-        self.coefficientShapes = {}
+        self.parameterShapes = {}
         self.outputLength = outputLength
     def __default__(self, data, children, meta):
         # check if all children are of the same shape
@@ -206,7 +206,7 @@ class GetCoefficientShapes(Transformer):
             raise ValueError("No children found. Please ensure the formula is correctly structured.")
     def variable(self, items): return (1,)
     def number(self, items): return (1,)
-    def coefficient(self, items): return items[0].value
+    def parameter(self, items): return items[0].value
     @v_args(inline = True)
     def funccall(self, name, args=None):
         if args is None:
@@ -222,13 +222,18 @@ class GetCoefficientShapes(Transformer):
         elif name in functionMap:
             for i in range(len(args)):
                 if type(args[i]) == str:
-                    if args[i] in self.coefficientShapes:
-                        args[i] = self.coefficientShapes[args[i]]
+                    if args[i] in self.parameterShapes:
+                        args[i] = self.parameterShapes[args[i]]
                     else:
-                        self.setCoefficientShape(args[i], (self.outputLength,))
+                        self.setParameterShape(args[i], (self.outputLength,))
                         args[i] = (self.outputLength,)
+
+            if requiresRandomKey(functionMap[name]):
+                args = [jax.random.key(0)] + [jnp.zeros(shape) for shape in args]
+            else:
+                args = [jnp.zeros(shape) for shape in args]
                     
-            return jnp.shape(functionMap[name](*[jnp.zeros(shape) for shape in args]))
+            return jnp.shape(functionMap[name](*args))
         else:
             raise ValueError(f"Function '{name}' is not supported in this context.")
     def operator(self, children):
@@ -244,12 +249,12 @@ class GetCoefficientShapes(Transformer):
             return op.matmul
         else:
             raise ValueError(f"Unknown operator: {children[0].value}")
-    def setCoefficientShape(self, coefficientName, shape):
-        if coefficientName in self.coefficientShapes:
-            if self.coefficientShapes[coefficientName] != shape:
-                raise ValueError(f"Coefficient '{coefficientName}' has inconsistent shapes: {self.coefficientShapes[coefficientName]} vs {shape}.")
+    def setParameterShape(self, parameterName, shape):
+        if parameterName in self.parameterShapes:
+            if self.parameterShapes[parameterName] != shape:
+                raise ValueError(f"Parameter '{parameterName}' has inconsistent shapes: {self.parameterShapes[parameterName]} vs {shape}.")
         else:
-            self.coefficientShapes[coefficientName] = shape
+            self.parameterShapes[parameterName] = shape
     def aggregate(self, children):
         if len(children) < 3:
             raise ValueError("Aggregate operation requires at least tree children.")
@@ -264,15 +269,15 @@ class GetCoefficientShapes(Transformer):
                     elif type(leftShape) == tuple and type(rightShape) == str:
                         name = rightShape
                         rightShape = leftShape
-                        self.setCoefficientShape(name, rightShape)
+                        self.setParameterShape(name, rightShape)
                         leftShape = operator(np.zeros(leftShape), np.zeros(rightShape)).shape
                     elif type(leftShape) == str and type(rightShape) == tuple:
                         name = leftShape
                         leftShape = rightShape
-                        self.setCoefficientShape(name, leftShape)
+                        self.setParameterShape(name, leftShape)
                         rightShape = operator(np.zeros(leftShape), np.zeros(rightShape)).shape
                     elif type(leftShape) == str and type(rightShape) == str:
-                        raise ValueError(f"Cannot derive shape for two coefficients: {leftShape} and {rightShape}.")
+                        raise ValueError(f"Cannot derive shape for two parameters: {leftShape} and {rightShape}.")
                     else:
                         raise ValueError(f"Cannot derive shape, should not happen: {leftShape} and {rightShape}.")
                 elif operator == op.matmul:
@@ -282,7 +287,7 @@ class GetCoefficientShapes(Transformer):
                         if len(leftShape) == 1:
                             name = rightShape
                             rightShape = [leftShape[-1], self.outputLength]
-                            self.setCoefficientShape(name, rightShape)
+                            self.setParameterShape(name, rightShape)
                             leftShape = np.matmul(np.zeros(leftShape), np.zeros(rightShape)).shape
                         else:
                             raise ValueError("Not implemented for more than 1D left shape.")
@@ -290,17 +295,17 @@ class GetCoefficientShapes(Transformer):
                         if len(rightShape) == 1:
                             name = leftShape
                             leftShape = [self.outputLength, rightShape[0]]
-                            self.setCoefficientShape(name, leftShape)
+                            self.setParameterShape(name, leftShape)
                             leftShape = np.matmul(np.zeros(leftShape), np.zeros(rightShape)).shape
                         elif len(rightShape) == 2:
                             name = leftShape
                             leftShape = [self.outputLength, rightShape[0], rightShape[1]]
-                            self.setCoefficientShape(name, leftShape)
+                            self.setParameterShape(name, leftShape)
                             leftShape = np.tensordot(np.zeros(leftShape), np.zeros(rightShape)).shape
                         else:
                             raise ValueError("Not implemented for more than 2D right shape.")
                     elif type(leftShape) == str and type(rightShape) == str:
-                        raise ValueError(f"Cannot derive shape for two coefficients: {leftShape} and {rightShape}.")
+                        raise ValueError(f"Cannot derive shape for two parameters: {leftShape} and {rightShape}.")
                     else:
                         raise ValueError(f"Cannot derive shape, should not happen: {leftShape} and {rightShape}.")
                 else:
@@ -316,16 +321,20 @@ class GetCoefficientShapes(Transformer):
 class GetValueFromData(Transformer):
     """
     A transformer to calculate the numerical value of a formula expression.
-    This expects a fully compiled formula with explicit coefficients.
+    This expects a fully compiled formula with explicit parameters.
     """
-    def __init__(self, params, data, dataColumns, t0, statesT0 = None, states = None):
+    def __init__(self, params = None, constants = None, data = None, 
+                 dataColumns = None, t0 = 0, statesT0 = None, states = None,
+                 parameterizations = None):
         super().__init__()
         self.params = params
+        self.constants = constants
         self.data = data
         self.dataColumns = dataColumns
         self.statesT0 = statesT0
         self.states = states
         self.t0 = t0
+        self.parameterizations = parameterizations
 
         if states and statesT0:
             raise ValueError("Both states and statesT0 are provided. Please provide only one of them.")
@@ -354,15 +363,36 @@ class GetValueFromData(Transformer):
         else:
             raise ValueError("Number expected but not found in the formula.")
         
-    def coefficient(self, children):
+    def parameter(self, children):
         if children:
-            coefficientName = children[0].value
-            if coefficientName in self.params:
-                return self.params[coefficientName]
+            parameterName = children[0].value
+            if parameterName in self.params:
+                if self.parameterizations is None:
+                    raise ValueError("Parameterizations are not defined. Please ensure parameterizations are set for the model.")
+                if parameterName in self.parameterizations:
+                    type = self.parameterizations[parameterName]["type"]
+                    parameterizationParams = self.parameterizations[parameterName]["parameters"]
+                    if type == "bounds":
+                        parameterName = parameterizationParams[0]
+                        bounds = self.parameterizations[parameterName]["bounds"]
+                        if bounds[0] is not None and bounds[1] is not None: # full bounds
+                            return jax.nn.sigmoid(self.params[parameterName]) * (bounds[1] - bounds[0]) + bounds[0]
+                        elif bounds[0] is not None: # lower bound only
+                            return jax.nn.softplus(self.params[parameterName]) + bounds[0]
+                        elif bounds[1] is not None: # upper bound only
+                            return -jax.nn.softplus(self.params[parameterName]) + bounds[1]
+                        else: # no bounds
+                            raise ValueError(f"Parameter '{parameterName}' has no bounds defined. Please ensure bounds are set for the parameter.")
+                    else:
+                        raise ValueError(f"Unknown parameterization type: {type}. Supported types are 'bounds'.")
+                else:
+                    return self.params[parameterName]
+            elif self.constants and parameterName in self.constants:
+                return self.constants[parameterName]
             else:
-                raise ValueError(f"Coefficient '{coefficientName}' not found in parameters.")
+                raise ValueError(f"Parameter '{parameterName}' not found in parameters.")
         else:
-            raise ValueError("Unnamed coefficient found. Please ensure all coefficients are named.")
+            raise ValueError("Unnamed parameter found. Please ensure all parameters are named.")
 
     def operator(self, children):
         if children[0].value == "+":
@@ -433,7 +463,12 @@ class GetValueFromData(Transformer):
         elif name in functionMap:
             if args is None:
                 args = []
-            return functionMap[name](*args.children)
+            else:
+                args = args.children
+            if requiresRandomKey(functionMap[name]):
+                return functionMap[name](jax.random.key(0), *args)
+            else:
+                return functionMap[name](*args)
         else:
             raise ValueError(f"Function '{name}' is not supported in this context.")
         

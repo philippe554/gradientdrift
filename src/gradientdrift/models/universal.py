@@ -3,7 +3,6 @@ import copy
 import jax
 import jax.numpy as jnp
 from jax import lax
-from functools import partial
 
 from gradientdrift.models.model import Model
 from gradientdrift.utils.formulawalkers import *
@@ -14,17 +13,71 @@ class Universal(Model):
         # Tokenize the formula
         formulaTree = ModelFormulaParser.parse(formula)
         formulaTree = RemoveNewlines().transform(formulaTree)
-        #print("Parsed formula tokens:\n" + formulaTree.pretty())
         
         statements = formulaTree.children
+        parameterDefinition = [{"tokens" : s} for s in statements if s.data == 'parameterdefinition']
+        constraintDefinitions = [{"tokens" : s} for s in statements if s.data == 'constraint']
         self.assignments = [{"tokens" : s} for s in statements if s.data == 'assignment']
         self.formulas = [{"tokens" : s} for s in statements if s.data == 'formula']
         self.optimize = [{"tokens" : s} for s in statements if s.data == 'optimize']
 
-        # Initialize parameters
-        self.params = {}
-        self.paramShapes = {}
+        # Process parameter definitions
+        self.parameters = {}
+        parameterDefinitionsFound = set()
+        for i, definition in enumerate(parameterDefinition):
+            names = [e.children[0].value for e in definition["tokens"].children[0].children]
+            if any(name in parameterDefinitionsFound for name in names):
+                raise ValueError(f"Duplicate parameter definition found for names: {', '.join(names)}. Each parameter must be defined only once.")
+            parameterDefinitionsFound.update(names)
+            for name in names:
+                self.parameters[name] = {}
+                self.parameters[name]["tokens"] = definition["tokens"]
+            for i in range(1, len(definition["tokens"].children), 2):
+                operator = definition["tokens"].children[i].value
+                if operator == "=":
+                    rhs = definition["tokens"].children[i + 1]
+                    if rhs.data == "shape":
+                        shape = tuple([int(e.value) for e in rhs.children])
+                        for name in names:
+                            self.parameters[name]["shape"] = shape
+                    else: # a sum can flatten to multiple token types, thus match anything
+                        valueGetter = GetValueFromData()
+                        constant = valueGetter.transform(rhs)
+                        for name in names:
+                            self.parameters[name]["constant"] = constant
+                elif operator == "~":
+                    initializer = definition["tokens"].children[i + 1]
+                    for name in names:
+                        self.parameters[name]["initializer"] = initializer
+                else:
+                    raise ValueError(f"Unsupported parameter definition operator '{operator}'. Supported operators are '=' and '~'.")
+                    
+        # Process constraints
+        self.parameterizations = {}
+        for i, constraint in enumerate(constraintDefinitions):
+            if constraint["tokens"].children[0].data == "boundconstraint":
+                constraintTokens = constraint["tokens"].children[0].children
+                if len(constraintTokens) == 2:
+                    left = constraintTokens[0]
+                    right = constraintTokens[1]
 
+                    valueGetter = GetValueFromData()
+                    if right.data == "parameterlist":
+                        value = valueGetter.transform(left)
+                        parameters = GetParameters().transform(right)
+                        for parameter in parameters:
+                            self.parameterizations[parameter] = {
+                                "type": "bounds",
+                                "bounds": [value, None],
+                                "parameters": [parameter]
+                            }
+                    else:
+                        raise ValueError(f"Right-hand side of bound constraint must be a parameter list. Found: {right.data}.")
+                else:
+                    raise ValueError(f"Bound constraint must have exactly 3 children: left-hand side, operator, and right-hand side. Found {len(constraintTokens)} children.")
+            else:
+                raise ValueError(f"Unsupported constraint type '{constraint['tokens'].data}'. Supported types are 'boundconstraint' and 'sumconstraint'.")
+            
         # Process assignments
         for i, assignment in enumerate(self.assignments):
             lhs, rhs = assignment["tokens"].children
@@ -38,18 +91,20 @@ class Universal(Model):
             assignment["leftPadding"] = assignment["maxDataLag"]
             assignment["rightPadding"] = 0
 
-            # Get coefficients names
-            coefficients = GetCoefficients().transform(rhs)
-            coefficientShapesGetter = GetCoefficientShapes(1)
-            outputShape = coefficientShapesGetter.transform(rhs)
+            # Get parameters names
+            parameters = GetParameters().transform(rhs)
+            parameterShapesGetter = GetParameterShapes(1)
+            outputShape = parameterShapesGetter.transform(rhs)
             if len(outputShape) == 1 and outputShape[0] == 1:
-                shapes = coefficientShapesGetter.coefficientShapes
+                shapes = parameterShapesGetter.parameterShapes
                 for name, shape in shapes.items():
-                    if name not in self.paramShapes:
-                        self.paramShapes[name] = shape
+                    if name not in self.parameters:
+                        self.parameters[name] = {"shape": shape}
                     else:
-                        if self.paramShapes[name] != shape:
-                            raise ValueError(f"Coefficient '{name}' has inconsistent shapes: {self.paramShapes[name]} vs {shape}.")
+                        if "shape" not in self.parameters[name]:
+                            self.parameters[name]["shape"] = shape
+                        elif self.parameters[name]["shape"] != shape:
+                            raise ValueError(f"Parameter '{name}' has inconsistent shapes: {self.parameters[name]['shape']} vs {shape}.")
             else:
                 raise ValueError(f"Output shape {outputShape[0]} is not compatible with the model.")
             
@@ -71,32 +126,34 @@ class Universal(Model):
             formula["leftPadding"] = max(formula["maxDataLag"], formula["maxMALag"])
             formula["rightPadding"] = 0
 
-            # Get coefficients names
-            coefficients = GetCoefficients().transform(rhs)
-            rhs = NameUnnamedCoefficients(coefficients).transform(rhs)
-            coefficients = GetCoefficients().transform(rhs)
+            # Get parameters names
+            parameters = GetParameters().transform(rhs)
+            rhs = NameUnnamedParameters(parameters).transform(rhs)
+            parameters = GetParameters().transform(rhs)
 
-            if len(coefficients) == 0: # No coefficients found, automatic mode
+            if len(parameters) == 0: # No parameters found, automatic mode
                 LabelOuterSum().visit(rhs)
-                rhs = InsertCoefficients().transform(rhs)
-                coefficients = GetCoefficients().transform(rhs)
-                if len(coefficients) == 0:
-                    raise ValueError("No coefficients found in the formula. Please ensure the formula is correctly specified.")
-                if len(set(coefficients)) != len(coefficients):
-                    raise ValueError("Duplicate coefficients found in the formula. Please ensure each coefficient is unique.")
-                coefficients = set(coefficients)
+                rhs = InsertParameters().transform(rhs)
+                parameters = GetParameters().transform(rhs)
+                if len(parameters) == 0:
+                    raise ValueError("No parameters found in the formula. Please ensure the formula is correctly specified.")
+                if len(set(parameters)) != len(parameters):
+                    raise ValueError("Duplicate parameters found in the formula. Please ensure each parameter is unique.")
+                parameters = set(parameters)
 
-            # Get coefficients shapes
-            coefficientShapesGetter = GetCoefficientShapes(len(formula["dependingVariables"]))
-            outputShape = coefficientShapesGetter.transform(rhs)
+            # Get parameters shapes
+            parameterShapesGetter = GetParameterShapes(len(formula["dependingVariables"]))
+            outputShape = parameterShapesGetter.transform(rhs)
             if len(outputShape) == 1 and outputShape[0] == len(formula["dependingVariables"]):
-                shapes = coefficientShapesGetter.coefficientShapes
+                shapes = parameterShapesGetter.parameterShapes
                 for name, shape in shapes.items():
-                    if name not in self.paramShapes:
-                        self.paramShapes[name] = shape
+                    if name not in self.parameters:
+                        self.parameters[name] = {"shape": shape}
                     else:
-                        if self.paramShapes[name] != shape:
-                            raise ValueError(f"Coefficient '{name}' has inconsistent shapes: {self.paramShapes[name]} vs {shape}.")
+                        if "shape" not in self.parameters[name]:
+                            self.parameters[name]["shape"] = shape
+                        elif self.parameters[name]["shape"] != shape:
+                            raise ValueError(f"Parameter '{name}' has inconsistent shapes: {self.parameters[name]['shape']} vs {shape}.")
             else:
                 raise ValueError(f"Output shape {outputShape[0]} is not compatible with the model.")
             
@@ -119,16 +176,19 @@ class Universal(Model):
             if maxLag != 0:
                 raise ValueError(f"Optimization function cannot have a lag. Found max lag: {maxLag}. Please ensure the optimization function is defined without lags.")
             
-            # Get coefficients names
-            coefficientShapesGetter = GetCoefficientShapes(1)
-            outputShape = coefficientShapesGetter.transform(sum)
-            shapes = coefficientShapesGetter.coefficientShapes
+            # Get parameters names
+            parameterShapesGetter = GetParameterShapes(1)
+            outputShape = parameterShapesGetter.transform(sum)
+            shapes = parameterShapesGetter.parameterShapes
             for name, shape in shapes.items():
-                if name not in self.paramShapes:
-                    self.paramShapes[name] = shape
+                if name not in self.parameters:
+                    self.parameters[name] = {"shape": shape}
                 else:
-                    if self.paramShapes[name] != shape:
-                        raise ValueError(f"Coefficient '{name}' has inconsistent shapes: {self.paramShapes[name]} vs {shape}.")
+                    if "shape" not in self.parameters[name]:
+                        self.parameters[name]["shape"] = shape
+                    elif self.parameters[name]["shape"] != shape:
+                        raise ValueError(f"Parameter '{name}' has inconsistent shapes: {self.parameters[name]['shape']} vs {shape}.")
+                    
             
             # Finalize the formula tokens
             reconstructed = ModelFormulaReconstructor.reconstruct(copy.deepcopy(sum))
@@ -137,8 +197,22 @@ class Universal(Model):
         if len(self.optimize) == 0:
             raise ValueError("No optimization function found in the formula. Please ensure the formula contains an optimization function.")
 
-        # Initialize coefficients
-        self.params = {name: jnp.ones(shape) for name, shape in self.paramShapes.items()}
+        self.parameterConstants = {}
+        self.parameterValues = {}
+        for name in self.parameters:
+            if "shape" not in self.parameters[name]:
+                raise ValueError(f"Parameter '{name}' does not have a shape defined. Please ensure the parameter is defined with a shape or can be derived from the formula.")
+            shape = self.parameters[name]["shape"]
+
+            if "constant" in self.parameters[name] and "initializer" in self.parameters[name]:
+                raise ValueError(f"Parameter '{name}' has both 'constant' and 'initializer' defined. Please define only one of them.")
+
+            if "constant" in self.parameters[name]:
+                valueGetter = GetValueFromData()
+                constant = valueGetter.transform(self.parameters[name]["constant"])
+                self.parameterConstants[name] = constant
+            else:
+                self.parameterValues[name] = jnp.ones(shape)
 
         # Get global properties
         self.leftPadding = max([formula["leftPadding"] for formula in self.formulas] + 
@@ -150,6 +224,23 @@ class Universal(Model):
         dataset.setLeftPadding(self.leftPadding)
         dataset.setRightPadding(self.rightPadding)
         self.dataColumns = dataset.columns # Move this to a better place if needed
+
+    def setRandomParameters(self, key):
+        numberOfParameters = len(self.parameterValues)
+        keys = jax.random.split(key, numberOfParameters)
+        
+        for i, name in enumerate(self.parameterValues):
+            if "initializer" in self.parameters[name]:
+                initializer = self.parameters[name]["initializer"]
+                valueGetter = GetValueFromData()
+                initialValue = jnp.asarray(valueGetter.transform(initializer))
+                initializerShape = jnp.shape(initialValue)
+                if initializerShape != jnp.shape(self.parameters[name]["shape"]):
+                    self.parameterValues[name] = jnp.broadcast_to(initialValue, self.parameters[name]["shape"])
+                else:
+                    self.parameterValues[name] = initialValue
+            else:
+                self.parameterValues[name] = jax.random.normal(keys[i], jnp.shape(self.parameters[name]["shape"])) * 0.1
 
     def predict(self, params, data):
         dataLength = data.shape[0]
@@ -165,7 +256,10 @@ class Universal(Model):
                 for i, assignment in enumerate(self.assignments):
                     oldValue = states[assignment["name"]][t0, :]
 
-                    valueGetter = GetValueFromData(params, data, self.dataColumns, t0, states = states)
+                    valueGetter = GetValueFromData(
+                        params = params, constants = self.parameterConstants, 
+                        data = data, dataColumns = self.dataColumns, t0 = t0, states = states,
+                        parameterizations = self.parameterizations)
                     newValue = valueGetter.transform(assignment["tokens"].children[1])
 
                     value = jnp.where(t0 >= assignment["leftPadding"], newValue, oldValue)
@@ -174,7 +268,9 @@ class Universal(Model):
                 for i, formula in enumerate(self.formulas):
                     oldValue = responses[i][t0, :]
 
-                    valueGetter = GetValueFromData(params, data, self.dataColumns, t0, states = states)
+                    valueGetter = GetValueFromData(
+                        params = params, constants = self.parameterConstants, data = data, dataColumns = self.dataColumns, 
+                        t0 = t0, states = states, parameterizations = self.parameterizations)
                     newValue = valueGetter.transform(formula["tokens"].children[1])
 
                     value = jnp.where(t0 >= formula["leftPadding"], newValue, oldValue)
@@ -193,12 +289,16 @@ class Universal(Model):
                 responses = {}
 
                 for i, assignment in enumerate(self.assignments):
-                    valueGetter = GetValueFromData(params, data, self.dataColumns, t0, statesT0 = states)
+                    valueGetter = GetValueFromData(
+                        params = params, constants = self.parameterConstants, data = data, dataColumns = self.dataColumns, 
+                        t0 = t0, statesT0 = states, parameterizations = self.parameterizations)
                     value = valueGetter.transform(assignment["tokens"].children[1])
                     states[assignment["name"]] = value
 
                 for i, formula in enumerate(self.formulas):
-                    valueGetter = GetValueFromData(params, data, self.dataColumns, t0, statesT0 = states)
+                    valueGetter = GetValueFromData(
+                        params = params, constants = self.parameterConstants, data = data, dataColumns = self.dataColumns, 
+                        t0 = t0, statesT0 = states, parameterizations = self.parameterizations)
                     value = valueGetter.transform(formula["tokens"].children[1])
                     responses[i] = value
 
@@ -209,14 +309,22 @@ class Universal(Model):
 
         return states, responses
 
-    def loss(self, params, data):
+    def loss(self, params, data, returnLossPerSample = False):
         states, responses = self.predict(params, data)
+
+        # for stateName, state in states.items():
+        #     print(f"State '{stateName}' shape: {jnp.shape(state)}")
+
+        # for i, response in responses.items():
+        #     print(f"Response {i} shape: {jnp.shape(response)}")
 
         losses = []
 
         for optimize in self.optimize:
-            def helper(t0):
-                valueGetter = GetValueFromData(params, data, self.dataColumns, t0, states = states)
+            def helper(statesT0, t0):
+                valueGetter = GetValueFromData(
+                    params = params, constants = self.parameterConstants, data = data, dataColumns = self.dataColumns, 
+                    t0 = t0, statesT0 = statesT0, parameterizations = self.parameterizations)
 
                 if optimize["type"] == "minimize":
                     return valueGetter.transform(optimize["tokens"].children[1])
@@ -225,8 +333,10 @@ class Universal(Model):
                 else:
                     raise ValueError(f"Unsupported optimization type '{optimize['type']}'. Supported types are 'minimize' and 'maximize'.")
 
-            batchedHelper = jax.vmap(helper)
-            loss = batchedHelper(jnp.arange(self.leftPadding, data.shape[0] - self.rightPadding))
+            batchedHelper = jax.vmap(helper, in_axes=(0, 0))
+            paddedStates = jax.tree_util.tree_map(lambda arr: arr[self.leftPadding:data.shape[0] - self.rightPadding, :], states)
+            timesteps = jnp.arange(self.leftPadding, data.shape[0] - self.rightPadding)
+            loss = batchedHelper(paddedStates, timesteps)
             lossShape = jnp.shape(loss)
             if len(lossShape) == 1 and lossShape[0] == data.shape[0] - self.leftPadding - self.rightPadding:
                 losses.append(loss)
@@ -236,6 +346,12 @@ class Universal(Model):
                 raise ValueError(f"Loss function returned unexpected shape {lossShape}. Expected shape is ({data.shape[0] - self.leftPadding - self.rightPadding},) or ({data.shape[0] - self.leftPadding - self.rightPadding}, n).")
 
         totalLossPerSample = jax.numpy.sum(jax.numpy.stack(losses, axis=1), axis=1)
-        totalLoss = jax.numpy.mean(totalLossPerSample)
 
-        return totalLoss
+        if jnp.shape(totalLossPerSample) != (data.shape[0] - self.leftPadding - self.rightPadding,):
+            raise ValueError(f"Total loss per sample has unexpected shape {jnp.shape(totalLossPerSample)}. Expected shape is ({data.shape[0] - self.leftPadding - self.rightPadding},).")
+        
+        if returnLossPerSample:
+            return totalLossPerSample
+        else:
+            totalLoss = jax.numpy.mean(totalLossPerSample)
+            return totalLoss

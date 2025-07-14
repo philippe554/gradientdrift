@@ -2,10 +2,10 @@
 
 
 class Batch:
-    def __init__(self, data):
+    def __init__(self, data, leftPadding, rightPadding):
         self.data = data
-        self.leftPadding = 0
-        self.rightPadding = 0
+        self.leftPadding = leftPadding
+        self.rightPadding = rightPadding
 
     def setData(self, data):
         self.data = data

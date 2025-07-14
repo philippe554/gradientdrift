@@ -8,7 +8,7 @@ class VAR(Model):
         self.numberOfLags = numberOfLags
         self.numberOfVariables = numberOfVariables
 
-        self.params = {
+        self.parameterValues = {
             'coeffs': jax.numpy.zeros((self.numberOfLags, self.numberOfVariables, self.numberOfVariables)),
             'const': jax.numpy.zeros((self.numberOfVariables,)),
             'logSigma': jax.numpy.zeros((self.numberOfVariables,))
@@ -35,12 +35,12 @@ class VAR(Model):
         if params['logSigma'].shape != (self.numberOfVariables,):
             raise ValueError(f"logSigma must have shape ({self.numberOfVariables},).")
         
-        self.params = params
+        self.parameterValues = params
 
     def setRandomParameters(self, key):
         key, keyCoeffs, keyConst, keyLogSigma = jax.random.split(key, 4)
 
-        self.params = {
+        self.parameterValues = {
             'coeffs': jax.random.normal(keyCoeffs, (self.numberOfLags, self.numberOfVariables, self.numberOfVariables)) * 0.1,
             'const': jax.random.normal(keyConst, (self.numberOfVariables,)) * 0.1, 
             'logSigma': jax.random.normal(keyLogSigma, (self.numberOfVariables,)) * 0.1
@@ -73,12 +73,12 @@ class VAR(Model):
             
             # Get the deterministic part of the prediction
             x_for_one_step = last_p_values
-            y_hat_batch = self.predict(self.params, x_for_one_step) 
+            y_hat_batch = self.predict(self.parameterValues, x_for_one_step) 
             y_hat_mean = y_hat_batch[0]
             
             # Create and add the random shock
             key, subkey = jax.random.split(currentKey)
-            sigma = jax.nn.softplus(self.params['logSigma'])
+            sigma = jax.nn.softplus(self.parameterValues['logSigma'])
             shock = jax.random.normal(subkey, shape=(self.numberOfVariables,)) * sigma
             y_simulated = y_hat_mean + shock
 
@@ -143,8 +143,8 @@ class VAR(Model):
 
         B = jax.numpy.linalg.solve(XXSum, XYSum)
 
-        self.params['const'] = B[:, 0].reshape(self.numberOfVariables)
-        self.params['coeffs'] = B[:, 1:].T.reshape(self.numberOfLags, self.numberOfVariables, self.numberOfVariables)
+        self.parameterValues['const'] = B[:, 0].reshape(self.numberOfVariables)
+        self.parameterValues['coeffs'] = B[:, 1:].T.reshape(self.numberOfLags, self.numberOfVariables, self.numberOfVariables)
 
         errorSumOfSquares = jax.numpy.zeros((self.numberOfVariables, self.numberOfVariables))
 
@@ -152,12 +152,12 @@ class VAR(Model):
             batch = dataset.getBatch(i)
             x = batch.data[:-1, :]
             y = batch.data[self.numberOfLags:, :]
-            yHat = self.predict(self.params, x)
+            yHat = self.predict(self.parameterValues, x)
             residuals = y - yHat
             errorSumOfSquares += residuals.T @ residuals
 
         sigma = jax.numpy.sqrt(jax.numpy.diag(errorSumOfSquares) / (dataset.getEffectiveNObs() - numberIndependentVariables))
         epsilon = 1e-9
-        self.params['logSigma'] = jax.numpy.log(jax.numpy.exp(sigma) - 1 + epsilon)
+        self.parameterValues['logSigma'] = jax.numpy.log(jax.numpy.exp(sigma) - 1 + epsilon)
 
 

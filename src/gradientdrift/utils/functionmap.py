@@ -3,8 +3,8 @@ import inspect
 import jax
 
 def getFunctionMap():
-    namespaces = [jax.numpy, jax.scipy, jax.nn]
-    defaultNamespaces = ["numpy", "scipy", "stats", "nn"]
+    namespaces = [jax.numpy, jax.scipy, jax.nn, jax.random]
+    defaultNamespaces = ["numpy", "scipy", "stats", "nn", "random"]
     functionMap = {}
 
     def recursiveSearchForFunctions(ns):
@@ -34,10 +34,26 @@ def getFunctionMap():
             if fullName != shortName and shortName not in functionMap:
                 functionMap[shortName] = func
 
-        for sub_ns in inspect.getmembers(ns, inspect.ismodule):
-            recursiveSearchForFunctions(sub_ns[1])
+        for name, object in inspect.getmembers(ns):
+            if inspect.isclass(object) or inspect.ismodule(object):
+                if name.startswith('_'):
+                    continue
+                recursiveSearchForFunctions(object)
 
     for ns in namespaces:
         recursiveSearchForFunctions(ns)
 
     return functionMap
+
+def requiresRandomKey(func):
+    try:
+        signature = inspect.signature(func)
+        parameters = list(signature.parameters.values())
+
+        if parameters and parameters[0].name == 'key':
+            return True
+        
+    except ValueError:
+        pass
+    
+    return False

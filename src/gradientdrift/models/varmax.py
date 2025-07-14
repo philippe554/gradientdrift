@@ -68,25 +68,25 @@ class VARMAX(Model):
         self.requiredPadding = max(self.maxArLag, self.maxExogLag if self.maxExogLag > -1 else 0)
 
         # --- Initialize Parameter Structures ---
-        self.params = {}
+        self.parameterValues = {}
         self.paramDims = {}
 
-        self.params['const'] = jnp.zeros((self.numberOfEndogVariables,))
+        self.parameterValues['const'] = jnp.zeros((self.numberOfEndogVariables,))
         self.paramDims['const'] = ["EQ[i]"]
 
         if self.arLags:
-            self.params['arCoeffs'] = jnp.zeros((len(self.arLags), self.numberOfEndogVariables, self.numberOfEndogVariables))
+            self.parameterValues['arCoeffs'] = jnp.zeros((len(self.arLags), self.numberOfEndogVariables, self.numberOfEndogVariables))
             self.paramDims['arCoeffs'] = ["L[i]", "AR[i]", "EQ[i]"]
 
         if self.maLags:
-            self.params['maCoeffs'] = jnp.zeros((len(self.maLags), self.numberOfEndogVariables, self.numberOfEndogVariables))
+            self.parameterValues['maCoeffs'] = jnp.zeros((len(self.maLags), self.numberOfEndogVariables, self.numberOfEndogVariables))
             self.paramDims['maCoeffs'] = ["L[i]", "MA[i]", "EQ[i]"]
 
         if self.numberOfExogVariables > 0:
-            self.params['exogCoeffs'] = jnp.zeros((len(self.exogLags), self.numberOfExogVariables, self.numberOfEndogVariables))
+            self.parameterValues['exogCoeffs'] = jnp.zeros((len(self.exogLags), self.numberOfExogVariables, self.numberOfEndogVariables))
             self.paramDims['exogCoeffs'] = ["L[i]", "EXOG[i]", "EQ[i]"]
 
-        self.params['logSigma'] = jnp.zeros((self.numberOfEndogVariables,))
+        self.parameterValues['logSigma'] = jnp.zeros((self.numberOfEndogVariables,))
         self.paramDims['logSigma'] = ["EQ[i]"]
 
     def requestPadding(self, dataset):
@@ -100,7 +100,7 @@ class VARMAX(Model):
         Args:
             params (dict): A dictionary containing the model parameters.
         """
-        expected_keys = set(self.params.keys())
+        expected_keys = set(self.parameterValues.keys())
         provided_keys = set(params.keys())
 
         if expected_keys != provided_keys:
@@ -135,15 +135,15 @@ class VARMAX(Model):
         if params['logSigma'].shape != (self.numberOfEndogVariables,):
             raise ValueError(f"logSigma must have shape ({self.numberOfEndogVariables},), but got {params['logSigma'].shape}.")
             
-        self.params = params
+        self.parameterValues = params
         return self
 
     def setRandomParameters(self, key):
         """Initializes all model parameters with small random values."""
         newParams = {}
-        numSplits = len(self.params)
+        numSplits = len(self.parameterValues)
         keys = jax.random.split(key, numSplits)
-        keyDict = {k: keys[i] for i, k in enumerate(self.params.keys())}
+        keyDict = {k: keys[i] for i, k in enumerate(self.parameterValues.keys())}
         
         newParams['const'] = jax.random.normal(keyDict['const'], (self.numberOfEndogVariables,)) * 0.1
         if self.arLags:
@@ -154,7 +154,7 @@ class VARMAX(Model):
             newParams['exogCoeffs'] = jax.random.normal(keyDict['exogCoeffs'], (len(self.exogLags), self.numberOfExogVariables, self.numberOfEndogVariables)) * 0.1
         newParams['logSigma'] = jax.random.normal(keyDict['logSigma'], (self.numberOfEndogVariables,)) * 0.1
         
-        self.params = newParams
+        self.parameterValues = newParams
         return self
 
     def _calculateConditionalMean(self, params, endogWindow, exogWindow, pastResiduals):
@@ -295,11 +295,11 @@ class VARMAX(Model):
                 )
 
             yHat = self._calculateConditionalMean(
-                self.params, carry["endogWindow"], currentExogWindow, carry["residualWindow"]
+                self.parameterValues, carry["endogWindow"], currentExogWindow, carry["residualWindow"]
             )
 
             newKey, subkey = jax.random.split(carry["key"])
-            sigma = jnp.exp(self.params['logSigma'])
+            sigma = jnp.exp(self.parameterValues['logSigma'])
             shock = jax.random.normal(subkey, shape=(self.numberOfEndogVariables,)) * sigma
             ySimulated = yHat + shock
 

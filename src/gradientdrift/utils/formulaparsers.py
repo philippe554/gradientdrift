@@ -3,10 +3,23 @@ from lark.reconstruct import Reconstructor
 
 formulaGrammar = r"""
 
-    model: NEWLINE* (formula | assignment | optimize) (NEWLINE+ (formula | assignment | optimize))* NEWLINE*
+    model: NEWLINE* statement (NEWLINE+ (statement))* NEWLINE*
     
+    ?statement: (formula | assignment | optimize | parameterdefinition | constraint)
+
     formula: dependingvariables "~" NEWLINE* sum
+
     assignment: NAME "=" NEWLINE* sum
+    
+    parameterdefinition: parameterlist (PARAMETERDEFINITIONOPERATOR NEWLINE* (sum | shape))+
+    PARAMETERDEFINITIONOPERATOR: "=" | "~"
+    parameterlist: parameter ("," NEWLINE* parameter)*
+    shape: "[" NEWLINE* (NUMBER NEWLINE* ("," NEWLINE* NUMBER NEWLINE* )*)? "]"
+
+    constraint: boundconstraint | sumconstraint 
+    boundconstraint: (sum "<" parameterlist) | (parameterlist "<" sum) | (sum "<" parameterlist "<" sum)
+    sumconstraint: ("sum" "(" parameterlist ")" "==" sum) | (sum "==" "sum" "(" parameterlist ")")
+    
     optimize: OPTIMIZETYPE ":" sum
     OPTIMIZETYPE: "minimize" | "maximize"
 
@@ -25,13 +38,13 @@ formulaGrammar = r"""
 
     ?atom: NUMBER -> number
          | NAME -> variable
-         | coefficient
+         | parameter
          | funccall
          | "(" NEWLINE* sum NEWLINE* ")"
 
     funccall: FUNCNAME "(" NEWLINE* [arguments NEWLINE*] ")"
     arguments: sum ("," NEWLINE* sum)*
-    coefficient: "{" NEWLINE* [NAME NEWLINE*] "}"
+    parameter: "{" NEWLINE* [NAME NEWLINE*] "}"
 
     FUNCNAME: /[a-zA-Z0-9.]+/
 
