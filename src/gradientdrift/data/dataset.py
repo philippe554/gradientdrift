@@ -52,14 +52,19 @@ class Dataset:
         else:
             start = self.leftPadding
             end = self.data.shape[0] - self.rightPadding
+            paddedBatchSize = batchSize + self.leftPadding + self.rightPadding
 
             self.batches = []
             for i in range(start, end, batchSize):
                 batchStart = i - self.leftPadding
                 batchEnd = min(i + batchSize, end) + self.rightPadding
                 batchData = self.data[batchStart:batchEnd]
+                if batchData.shape[0] != paddedBatchSize:
+                    continue  # Skip incomplete batches for now
                 batch = Batch(batchData, self.leftPadding, self.rightPadding)
                 self.batches.append(batch)
+
+            print(f"Prepared {len(self.batches)} batches with size {batchSize} (padded to {paddedBatchSize})")
                 
     def getNumberOfBatches(self):
         return len(self.batches)

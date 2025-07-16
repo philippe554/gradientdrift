@@ -6,180 +6,179 @@ import scipy
 import datetime
 import re
 import jax.numpy as jnp
+from functools import partial
 
 class Model:
     def fitClosedForm(self, dataset, batchSize = 100):
         raise NotImplementedError("This method should be implemented in subclasses.")
     
-    def fit(self, dataset, seed = 42, batchSize = -1, maxNumberOfSteps = 1000, parameterUpdateFrequency = 1, optimizer = "ADAM"):
-
-        if optimizer.lower() == "closedform":
-            self.fitClosedForm(dataset, batchSize)
-            return
-
-        fitStartTime = datetime.datetime.now()
-
-        self.fitConfig = {
-            "Seed": seed,
-            "Batch size": "Full batch" if batchSize == -1 else batchSize,
-            "Max number of steps": maxNumberOfSteps,
-            "Parameter update frequency": "Once per step" if parameterUpdateFrequency == -1 else "Every " + str(parameterUpdateFrequency) + " batches",
-            "Fit start time": fitStartTime.strftime("%a, %d %b %Y %H:%M:%S"),
-        }
-
-        # Prepare the optimization environment
-        key = jax.random.PRNGKey(seed)
-        key, subkey = jax.random.split(key)
-        self.setRandomParameters(subkey)      
-
-        if optimizer.lower() == "adam":
-            optimizerObj = optax.adam(0.1)
-            optimizerUsesState = False
-            self.fitConfig["Optimizer"] = "ADAM"
-            self.fitConfig["Learning rate"] = 0.1
-
-        elif optimizer.lower() == "lbfgs":
-            optimizerObj = optax.lbfgs()
-            optimizerUsesState = True
-            self.fitConfig["Optimizer"] = "L-BFGS"
-
-        else:
-            raise ValueError(f"Unknown optimizer: {optimizer}. Supported optimizers are 'adam' and 'lbfgs'.")
-        
-        optimizerState = optimizerObj.init(self.parameterValues)
-        
-        # Prepare the dataset
-        self.requestPadding(dataset)
-        dataset.prepareBatches(batchSize)
-        numberOfSamples = dataset.getEffectiveNObs()
-        numberOfBatches = dataset.getNumberOfBatches()
-        if numberOfBatches == 0:
-            raise ValueError("No batches available. Check if the dataset is properly prepared and has enough data.")
-
-        if parameterUpdateFrequency == -1:
-            parameterUpdateFrequency = numberOfBatches
-
-        if not optimizerUsesState:
-            @jax.jit
-            def calcGrad(params, batch):
-                loss, grads = jax.value_and_grad(self.loss)(params, batch)
-                return loss, grads
+    def fit(self, dataset, seed = 42, batchSize = -1, maxNumberOfSteps = 1000, parameterUpdateFrequency = -1, optimizer = "ADAM"):
+        try:
+            key = jax.random.PRNGKey(seed)
             
-            @jax.jit
-            def applyUpdate(grads, params, optState):
-                updates, newOptState = optimizerObj.update(grads, optState)
-                newParams = optax.apply_updates(params, updates)
-                return newParams, newOptState
+            if optimizer.lower() == "closedform":
+                self.fitClosedForm(dataset, batchSize)
+                return
+
+            fitStartTime = datetime.datetime.now()
+
+            self.fitConfig = {
+                "Seed": seed,
+                "Batch size": "Full batch" if batchSize == -1 else batchSize,
+                "Max number of steps": maxNumberOfSteps,
+                "Parameter update frequency": "Once per step" if parameterUpdateFrequency == -1 else "Every " + str(parameterUpdateFrequency) + " batches",
+                "Fit start time": fitStartTime.strftime("%a, %d %b %Y %H:%M:%S"),
+            }   
+
+            if optimizer.lower() == "adam":
+                learningRate = 0.01
+                optimizerObj = optax.adam(learningRate)
+                optimizerUsesState = False
+                self.fitConfig["Optimizer"] = "ADAM"
+                self.fitConfig["Learning rate"] = learningRate
+
+            elif optimizer.lower() == "lbfgs":
+                optimizerObj = optax.lbfgs()
+                optimizerUsesState = True
+                self.fitConfig["Optimizer"] = "L-BFGS"
+
+            else:
+                raise ValueError(f"Unknown optimizer: {optimizer}. Supported optimizers are 'adam' and 'lbfgs'.")
             
-        else:
-            @jax.jit
-            def calcGradWithState(params, batch, optimizerState):
-                loss, grads = optax.value_and_grad_from_state(self.loss)(params, batch, state = optimizerState)
-                return loss, grads
-        
-            @jax.jit
-            def compiledLoss(params, data):
-                return self.loss(params, data)
+            optimizerState = optimizerObj.init(self.parameterValues)
             
-            def applyUpdateWithLineSearch(grads, params, optState, loss, selectedBatches):
-                def lossOverBatches(params):
-                    lossSum = 0
-                    for i in selectedBatches:
-                        batch = dataset.getBatch(i)
-                        lossSum += compiledLoss(params, batch.data)
-                    return lossSum / len(selectedBatches)
+            # Prepare the dataset
+            self.requestPadding(dataset)
+            dataset.prepareBatches(batchSize)
+            numberOfSamples = dataset.getEffectiveNObs()
+            numberOfBatches = dataset.getNumberOfBatches()
+            if numberOfBatches == 0:
+                raise ValueError("No batches available. Check if the dataset is properly prepared and has enough data.")
+
+            if parameterUpdateFrequency == -1:
+                parameterUpdateFrequency = numberOfBatches
+
+            if not optimizerUsesState:
+                @jax.jit
+                def calcGrad(params, batch):
+                    loss, grads = jax.value_and_grad(self.loss)(params, batch)
+                    return loss, grads
                 
-                updates, newOptState = optimizerObj.update(
-                    grads, optState, params, value = loss, grad = grads, value_fn = lossOverBatches
-                )
+                @jax.jit
+                def applyUpdate(grads, params, optState):
+                    updates, newOptState = optimizerObj.update(grads, optState)
+                    newParams = optax.apply_updates(params, updates)
+                    return newParams, newOptState
                 
-                newParams = optax.apply_updates(params, updates)
-                return newParams, newOptState
-        
-        previousStepLoss = float('inf')
-        
-        # Run the optimization loop 
-        for step in range(maxNumberOfSteps):
-
-            self.fitConfig["Number of steps"] = step + 1
-
-            stepStartParams = jax.tree_util.tree_map(lambda x: x, self.parameterValues)
-
-            stepLoss = 0.0
-            stepGrads = jax.tree_util.tree_map(jax.numpy.zeros_like, self.parameterValues)
-
-            key, subkey = jax.random.split(key)
-            batchOrder = jax.random.permutation(subkey, numberOfBatches)
+            else:
+                @jax.jit
+                def calcGradWithState(params, batch, optimizerState):
+                    loss, grads = optax.value_and_grad_from_state(self.loss)(params, batch, state = optimizerState)
+                    return loss, grads
+                
+                @jax.jit
+                def applyUpdateWithLineSearch(grads, params, optState, loss, batches):
+                    def lossOverBatches(params):
+                        batchLosses = jax.vmap(self.loss, in_axes=(None, 0))(params, batches)
+                        return jax.numpy.mean(batchLosses)
+                    
+                    updates, newOptState = optimizerObj.update(
+                        grads, optState, params, value = loss, grad = grads, value_fn = lossOverBatches
+                    )
+                    
+                    newParams = optax.apply_updates(params, updates)
+                    return newParams, newOptState
             
-            aggregatedLoss = 0.0
-            aggregatedGrads = jax.tree_util.tree_map(jax.numpy.zeros_like, self.parameterValues)
-            aggregatedCount = 0
-            selectedBatches = []
+            previousStepLoss = float('inf')
+            
+            # Run the optimization loop 
+            for step in range(maxNumberOfSteps):
 
-            def applyHelper():
-                nonlocal aggregatedGrads, aggregatedCount, selectedBatches, aggregatedLoss, optimizerState
-                if aggregatedCount == 0:
-                    raise ValueError("Aggregated count should not be zero at this point.")
-                if aggregatedCount > 1:
-                    avgGrads = jax.tree_util.tree_map(lambda g: g / aggregatedCount, aggregatedGrads)
-                else:
-                    avgGrads = aggregatedGrads
+                self.fitConfig["Number of steps"] = step + 1
 
-                avgBatchLoss = aggregatedLoss / aggregatedCount
+                stepStartParams = jax.tree_util.tree_map(lambda x: x, self.parameterValues)
 
-                if not optimizerUsesState:
-                    self.parameterValues, optimizerState = applyUpdate(avgGrads, self.parameterValues, optimizerState)
-                else:
-                    self.parameterValues, optimizerState = applyUpdateWithLineSearch(avgGrads, self.parameterValues, optimizerState, avgBatchLoss, selectedBatches)                        
+                stepLoss = 0.0
+                stepGrads = jax.tree_util.tree_map(jax.numpy.zeros_like, self.parameterValues)
+
+                key, subKey = jax.random.split(key)
+                batchOrder = jax.random.permutation(subKey, numberOfBatches)
                 
                 aggregatedLoss = 0.0
                 aggregatedGrads = jax.tree_util.tree_map(jax.numpy.zeros_like, self.parameterValues)
                 aggregatedCount = 0
                 selectedBatches = []
 
-            for i in range(numberOfBatches):
-                selectedBatches.append(batchOrder[i])
-                batch = dataset.getBatch(batchOrder[i])
-                
-                if not optimizerUsesState:
-                    loss, grads = calcGrad(self.parameterValues, batch.data)
-                else:
-                    loss, grads = calcGradWithState(self.parameterValues, batch.data, optimizerState)
+                def applyHelper():
+                    nonlocal aggregatedGrads, aggregatedCount, selectedBatches, aggregatedLoss, optimizerState
+                    if aggregatedCount == 0:
+                        raise ValueError("Aggregated count should not be zero at this point.")
+                    if aggregatedCount > 1:
+                        avgGrads = jax.tree_util.tree_map(lambda g: g / aggregatedCount, aggregatedGrads)
+                    else:
+                        avgGrads = aggregatedGrads
 
-                stepLoss += loss * batch.getEffectiveNObs()
-                stepGrads = jax.tree_util.tree_map(jax.numpy.add, stepGrads, grads)
+                    avgBatchLoss = aggregatedLoss / aggregatedCount
 
-                aggregatedLoss += loss
-                aggregatedGrads = jax.tree_util.tree_map(jax.numpy.add, aggregatedGrads, grads)
-                aggregatedCount += 1
-                
-                if aggregatedCount == parameterUpdateFrequency:
+                    if not optimizerUsesState:
+                        self.parameterValues, optimizerState = applyUpdate(avgGrads, self.parameterValues, optimizerState)
+                    else:
+                        batches = [dataset.getBatch(i).data for i in selectedBatches]
+                        stackedBatches = jax.tree_util.tree_map(lambda *args: jnp.stack(args, axis=0), *batches)
+                        self.parameterValues, optimizerState = applyUpdateWithLineSearch(
+                            avgGrads, self.parameterValues, optimizerState, avgBatchLoss, stackedBatches)                        
+                        
+                    aggregatedLoss = 0.0
+                    aggregatedGrads = jax.tree_util.tree_map(jax.numpy.zeros_like, self.parameterValues)
+                    aggregatedCount = 0
+                    selectedBatches = []
+
+                for i in range(numberOfBatches):
+                    selectedBatches.append(batchOrder[i])
+                    batch = dataset.getBatch(batchOrder[i])
+                    
+                    if not optimizerUsesState:
+                        loss, grads = calcGrad(self.parameterValues, batch.data)
+                    else:
+                        loss, grads = calcGradWithState(self.parameterValues, batch.data, optimizerState)
+
+                    stepLoss += loss * batch.getEffectiveNObs()
+                    stepGrads = jax.tree_util.tree_map(jax.numpy.add, stepGrads, grads)
+
+                    aggregatedLoss += loss
+                    aggregatedGrads = jax.tree_util.tree_map(jax.numpy.add, aggregatedGrads, grads)
+                    aggregatedCount += 1
+                    
+                    if aggregatedCount == parameterUpdateFrequency:
+                        applyHelper()
+
+                if aggregatedCount > 0:
                     applyHelper()
 
-            if aggregatedCount > 0:
-                applyHelper()
+                sampleLoss = stepLoss / numberOfSamples  
+                print(f"Step {step+1:4d}, Loss: {sampleLoss:.6f}")
 
-            sampleLoss = stepLoss / numberOfSamples  
-            print(f"Step {step+1:4d}, Loss: {sampleLoss:.6f}")
+                lossImprovement = abs(previousStepLoss - sampleLoss)
+                previousStepLoss = sampleLoss
+                if lossImprovement < 1e-9:
+                    print("Convergence reached based on loss threshold.")
+                    break
 
-            lossImprovement = abs(previousStepLoss - sampleLoss)
-            previousStepLoss = sampleLoss
-            if lossImprovement < 1e-7:
-                print("Convergence reached based on loss threshold.")
-                break
+                stepGrads = jax.tree_util.tree_map(lambda g: g / numberOfBatches, stepGrads)
+                grad_norm = jax.numpy.linalg.norm(jax.tree_util.tree_flatten(stepGrads)[0][0])
 
-            stepGrads = jax.tree_util.tree_map(lambda g: g / numberOfBatches, stepGrads)
-            grad_norm = jax.numpy.linalg.norm(jax.tree_util.tree_flatten(stepGrads)[0][0])
+                if grad_norm < 1e-7:
+                    print("Convergence reached based on gradient norm.")
+                    break
 
-            if grad_norm < 1e-7:
-                print("Convergence reached based on gradient norm.")
-                break
+                pamamsChange = jax.tree_util.tree_map(lambda new, old: new - old, self.parameterValues, stepStartParams)
+                pamamsChangeNorm = jax.numpy.linalg.norm(jax.tree_util.tree_flatten(pamamsChange)[0][0])
+                if pamamsChangeNorm < 1e-7:
+                    print("Convergence reached based on parameter change norm.")
+                    break
 
-            pamamsChange = jax.tree_util.tree_map(lambda new, old: new - old, self.parameterValues, stepStartParams)
-            pamamsChangeNorm = jax.numpy.linalg.norm(jax.tree_util.tree_flatten(pamamsChange)[0][0])
-            if pamamsChangeNorm < 1e-5:
-                print("Convergence reached based on parameter change norm.")
-                break
+        except KeyboardInterrupt:
+            print("Optimization interrupted by user. Press Ctrl+C again to exit.")
 
         fitEndTime = datetime.datetime.now()
         self.fitConfig["Fit end time"] = fitEndTime.strftime("%a, %d %b %Y %H:%M:%S")
@@ -224,11 +223,6 @@ class Model:
         hessian = hessianSum / numberOfBatches
         return hessian, OPGSum      
     
-    def setRandomParameters(self, key):
-        numberOfParameters = len(self.parameterValues)
-        keys = jax.random.split(key, numberOfParameters)
-        self.parameterValues = { name : jax.random.normal(key, jnp.shape(param)) * 0.1 for key, (name, param) in zip(keys, self.parameterValues.items()) }
-
     def getVariablePrettyName(self, variableName, indexList):
         if not hasattr(self, "paramDims") or variableName not in self.paramDims:
             return variableName + "[" + ".".join(map(str, indexList)) + "]"

@@ -3,6 +3,7 @@ import copy
 import jax
 import jax.numpy as jnp
 from jax import lax
+from functools import partial
 
 from gradientdrift.models.model import Model
 from gradientdrift.utils.formulawalkers import *
@@ -12,7 +13,7 @@ class Universal(Model):
     def __init__(self, formula):
         self.constructModel(formula)
 
-    def constructModel(self, formula):
+    def constructModel(self, formula, key = jax.random.PRNGKey(42)):
         # Tokenize the formula
         formulaTree = ModelFormulaParser.parse(formula)
         formulaTree = RemoveNewlines().transform(formulaTree)
@@ -35,26 +36,14 @@ class Universal(Model):
             parameterDefinitionsFound.update(names)
             for name in names:
                 self.parameters[name] = {}
-                self.parameters[name]["tokens"] = definition["tokens"]
-            for i in range(1, len(definition["tokens"].children), 2):
-                operator = definition["tokens"].children[i].value
-                if operator == "=":
-                    rhs = definition["tokens"].children[i + 1]
-                    if rhs.data == "shape":
-                        shape = tuple([int(e.value) for e in rhs.children])
-                        for name in names:
-                            self.parameters[name]["shape"] = shape
-                    else: # a sum can flatten to multiple token types, thus match anything
-                        valueGetter = GetValueFromData()
-                        constant = valueGetter.transform(rhs)
-                        for name in names:
-                            self.parameters[name]["constant"] = constant
-                elif operator == "~":
-                    initializer = definition["tokens"].children[i + 1]
+            for rhs in definition["tokens"].children[1:]:
+                if rhs.data == "shape":
+                    shape = tuple([int(e.value) for e in rhs.children])
                     for name in names:
-                        self.parameters[name]["initializer"] = initializer
-                else:
-                    raise ValueError(f"Unsupported parameter definition operator '{operator}'. Supported operators are '=' and '~'.")
+                        self.parameters[name]["shape"] = shape
+                else: # a sum can flatten to multiple token types, thus match anything
+                    for name in names:
+                        self.parameters[name]["tokens"] = rhs
                     
         # Process constraints
         self.parameterizations = {}
@@ -72,7 +61,8 @@ class Universal(Model):
                         for parameter in parameters:
                             self.parameterizations[parameter] = {
                                 "unconstraintParameterNames": [parameter],
-                                "apply": lambda p: jax.nn.softplus(p) + value
+                                "apply": lambda p, v = value: jax.nn.softplus(p) + v,
+                                "inverse": lambda p, v = value: jnp.log(jnp.exp(p - v) - 1)
                             }
                     else:
                         raise ValueError(f"Right-hand side of bound constraint must be a parameter list. Found: {right.data}.")
@@ -203,25 +193,36 @@ class Universal(Model):
             reconstructed = ModelFormulaReconstructor.reconstruct(copy.deepcopy(sum))
             print(optimize['type'] + ":", reconstructed)
 
-        if len(self.optimize) == 0:
-            raise ValueError("No optimization function found in the formula. Please ensure the formula contains an optimization function.")
-
+        keys = jax.random.split(key, len(self.parameters))
         self.parameterConstants = {}
         self.parameterValues = {}
-        for name in self.parameters:
+        for i, name in enumerate(self.parameters):
             if "shape" not in self.parameters[name]:
                 raise ValueError(f"Parameter '{name}' does not have a shape defined. Please ensure the parameter is defined with a shape or can be derived from the formula.")
             shape = self.parameters[name]["shape"]
 
-            if "constant" in self.parameters[name] and "initializer" in self.parameters[name]:
-                raise ValueError(f"Parameter '{name}' has both 'constant' and 'initializer' defined. Please define only one of them.")
+            if "tokens" in self.parameters[name]:
+                valueGetter = GetValueFromData(randomKey = keys[i])
+                value = valueGetter.transform(self.parameters[name]["tokens"])
 
-            if "constant" in self.parameters[name]:
-                valueGetter = GetValueFromData()
-                constant = valueGetter.transform(self.parameters[name]["constant"])
-                self.parameterConstants[name] = constant
+                if name in self.parameterizations:
+                    value = self.parameterizations[name]["inverse"](value)
+
+                if "isConstant" in self.parameters[name] and self.parameters[name]["isConstant"]:
+                    self.parameterConstants[name] = jnp.broadcast_to(value, shape)
+                else:
+                    self.parameterValues[name] = jnp.broadcast_to(value, shape)
             else:
-                self.parameterValues[name] = jnp.ones(shape)
+                value = jax.random.normal(keys[i], shape) * 0.1 
+                self.parameterValues[name] = jnp.broadcast_to(value, shape)
+                
+        # Check if any parameters are NaN or infinite
+        for name, value in self.parameterValues.items():
+            if jnp.any(jnp.isnan(value)) or jnp.any(jnp.isinf(value)):
+                raise ValueError(f"Parameter '{name}' contains NaN or infinite values. Please check the parameter initialization.")
+        for name, value in self.parameterConstants.items():
+            if jnp.any(jnp.isnan(value)) or jnp.any(jnp.isinf(value)):
+                raise ValueError(f"Constant parameter '{name}' contains NaN or infinite values. Please check the parameter initialization.")
 
         # Get global properties
         self.leftPadding = max([formula["leftPadding"] for formula in self.formulas] + 
@@ -229,6 +230,9 @@ class Universal(Model):
         self.rightPadding = max([formula["rightPadding"] for formula in self.formulas] + 
                                 [assignment["rightPadding"] for assignment in self.assignments])
         
+        # Initialize data columns to None, in case predict is called as a standalone method
+        self.dataColumns = None
+
         super().constructModel()
 
     def requestPadding(self, dataset):
@@ -236,25 +240,20 @@ class Universal(Model):
         dataset.setRightPadding(self.rightPadding)
         self.dataColumns = dataset.columns # Move this to a better place if needed
 
-    def setRandomParameters(self, key):
-        numberOfParameters = len(self.parameterValues)
-        keys = jax.random.split(key, numberOfParameters)
+    @partial(jax.jit, static_argnames=["self", "steps"])
+    def predict(self, params = None, data = None, steps = None):
+        if params is None:
+            params = self.parameterValues
         
-        for i, name in enumerate(self.parameterValues):
-            if "initializer" in self.parameters[name]:
-                initializer = self.parameters[name]["initializer"]
-                valueGetter = GetValueFromData()
-                initialValue = jnp.asarray(valueGetter.transform(initializer))
-                initializerShape = jnp.shape(initialValue)
-                if initializerShape != jnp.shape(self.parameters[name]["shape"]):
-                    self.parameterValues[name] = jnp.broadcast_to(initialValue, self.parameters[name]["shape"])
-                else:
-                    self.parameterValues[name] = initialValue
-            else:
-                self.parameterValues[name] = jax.random.normal(keys[i], jnp.shape(self.parameters[name]["shape"])) * 0.1
+        if data is not None:
+            dataLength = data.shape[0]
+        else:
+            if steps is None:
+                raise ValueError("Either 'data' or 'steps' must be provided to predict.")
+            dataLength = steps
 
-    def predict(self, params, data):
-        dataLength = data.shape[0]
+        # TODO: better random key handling
+        randomKey = jax.random.PRNGKey(0) 
 
         if self.leftPadding > 0:
             states = {assignment["name"] : jnp.zeros((dataLength, 1)) for assignment in self.assignments}
@@ -271,10 +270,10 @@ class Universal(Model):
                     raise ValueError(f"Initialization parameter '{parameterName}' not found in assignments. Please ensure the parameter is defined in the formula.")
             
             responses = {i: jnp.zeros((dataLength, len(formula["dependingVariables"]))) for i, formula in enumerate(self.formulas)}
-            initialCarry = (states, responses)
+            initialCarry = (states, responses, randomKey)
 
             def forward(carry, t0):
-                states, responses = carry
+                states, responses, randomKey = carry
 
                 for i, assignment in enumerate(self.assignments):
                     oldValue = states[assignment["name"]][t0, :]
@@ -282,8 +281,9 @@ class Universal(Model):
                     valueGetter = GetValueFromData(
                         params = params, constants = self.parameterConstants, 
                         data = data, dataColumns = self.dataColumns, t0 = t0, states = states,
-                        parameterizations = self.parameterizations)
+                        parameterizations = self.parameterizations, randomKey = randomKey)
                     newValue = valueGetter.transform(assignment["tokens"].children[1])
+                    randomKey = valueGetter.randomKey
 
                     value = jnp.where(t0 >= assignment["leftPadding"], newValue, oldValue)
                     states[assignment["name"]] = states[assignment["name"]].at[t0, :].set(value)
@@ -293,20 +293,24 @@ class Universal(Model):
 
                     valueGetter = GetValueFromData(
                         params = params, constants = self.parameterConstants, data = data, dataColumns = self.dataColumns, 
-                        t0 = t0, states = states, parameterizations = self.parameterizations)
+                        t0 = t0, states = states, parameterizations = self.parameterizations,
+                        randomKey = randomKey)
                     newValue = valueGetter.transform(formula["tokens"].children[1])
+                    randomKey = valueGetter.randomKey
 
                     value = jnp.where(t0 >= formula["leftPadding"], newValue, oldValue)
                     responses[i] = responses[i].at[t0, :].set(value)
 
-                carry = states, responses
+                carry = states, responses, randomKey
 
                 return carry, {}
 
             finalCarry, _ = lax.scan(forward, initialCarry, jnp.arange(dataLength))
-            states, responses = finalCarry
+            states, responses, randomKey = finalCarry
 
         else:
+            # TODO: add random key support for batched forward pass
+
             def forward(t0):
                 states = {}
                 responses = {}
@@ -332,6 +336,7 @@ class Universal(Model):
 
         return states, responses
 
+    @partial(jax.jit, static_argnames=["self", "returnLossPerSample"])
     def loss(self, params, data, returnLossPerSample = False):
         states, responses = self.predict(params, data)
 
@@ -373,6 +378,9 @@ class Universal(Model):
         if jnp.shape(totalLossPerSample) != (data.shape[0] - self.leftPadding - self.rightPadding,):
             raise ValueError(f"Total loss per sample has unexpected shape {jnp.shape(totalLossPerSample)}. Expected shape is ({data.shape[0] - self.leftPadding - self.rightPadding},).")
         
+        burnInTime = 100
+        totalLossPerSample = totalLossPerSample[burnInTime:]
+
         if returnLossPerSample:
             return totalLossPerSample
         else:

@@ -5,15 +5,14 @@ formulaGrammar = r"""
 
     model: NEWLINE* statement (NEWLINE+ (statement))* NEWLINE*
     
-    ?statement: (formula | initialization | assignment | optimize | parameterdefinition | constraint)
+    ?statement: (parameterdefinition | formula | initialization | assignment | optimize | constraint)
 
     formula: dependingvariables "~" NEWLINE* sum
 
     initialization: NAME "[" NEWLINE* NUMBER NEWLINE* "]" "=" NEWLINE* sum
     assignment: NAME "=" NEWLINE* sum
     
-    parameterdefinition: parameterlist (PARAMETERDEFINITIONOPERATOR NEWLINE* (sum | shape))+
-    PARAMETERDEFINITIONOPERATOR: "=" | "~"
+    parameterdefinition: ("const")? parameterlist ("=" NEWLINE* (sum | shape))+
     parameterlist: parameter ("," NEWLINE* parameter)*
     shape: "[" NEWLINE* (NUMBER NEWLINE* ("," NEWLINE* NUMBER NEWLINE* )*)? "]"
 
@@ -33,11 +32,13 @@ formulaGrammar = r"""
     ?sumoperator: SUMOPERATOR -> operator
     SUMOPERATOR: "+" | "-"
 
-    ?product: atom (productopertor NEWLINE* atom)*
+    ?product: exponent (productopertor NEWLINE* exponent)*
     ?productopertor: PRODUCTOPERATOR -> operator
     PRODUCTOPERATOR: "*" | "/" | "@"
 
-    ?atom: NUMBER -> number
+    ?exponent: atom ("^" NEWLINE* atom)?
+
+    ?atom: (NUMBER | "-" NUMBER) -> number
          | NAME -> variable
          | parameter
          | funccall

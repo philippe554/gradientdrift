@@ -74,10 +74,11 @@ class SetLeafNodeLags(Interpreter):
             else:
                 raise ValueError(f"Function '{name}' requires a lag argument.")
 
-        for arg in args.children:
-            if isinstance(arg, Tree):
-                arg.meta.lag = meta.lag
-                self.visit(arg)
+        if args is not None:
+            for arg in args.children:
+                if isinstance(arg, Tree):
+                    arg.meta.lag = meta.lag
+                    self.visit(arg)
 
 class GetMaxLag(Transformer):
     """A transformer to find the maximum lag used in a formula."""
@@ -91,6 +92,8 @@ class GetMaxLag(Transformer):
     @v_args(inline = True, meta = True)
     def funccall(self, meta, name, args=None):
         funcLag = meta.lag if hasattr(meta, 'lag') else 0
+        if args is None:
+            args = 0
         return max(funcLag, args)
         
 class GetParameters(Transformer):
@@ -325,7 +328,7 @@ class GetValueFromData(Transformer):
     """
     def __init__(self, params = None, constants = None, data = None, 
                  dataColumns = None, t0 = 0, statesT0 = None, states = None,
-                 parameterizations = None):
+                 parameterizations = None, randomKey = None):
         super().__init__()
         self.params = params
         self.constants = constants
@@ -335,6 +338,7 @@ class GetValueFromData(Transformer):
         self.states = states
         self.t0 = t0
         self.parameterizations = parameterizations
+        self.randomKey = randomKey
 
         if states and statesT0:
             raise ValueError("Both states and statesT0 are provided. Please provide only one of them.")
@@ -342,7 +346,7 @@ class GetValueFromData(Transformer):
     @v_args(meta = True)
     def variable(self, meta, children):
         variableName = children[0].value
-        if variableName in self.dataColumns:
+        if self.dataColumns and variableName in self.dataColumns:
             t = self.t0 - meta.lag
             variableIndex = self.dataColumns.index(variableName)
             return self.data[t, variableIndex]
@@ -433,6 +437,18 @@ class GetValueFromData(Transformer):
     def sum(self, children):
         return self.aggregate(children)
 
+    def exponent(self, children):
+        if len(children) == 2:
+            base = children[0]
+            exponent = children[1]
+            if np.shape(base) == tuple():
+                base = np.reshape(base, (1,))
+            if np.shape(exponent) == tuple():
+                exponent = np.reshape(exponent, (1,))
+            return jnp.power(base, exponent)
+        else:
+            raise ValueError("Exponentiation requires exactly two children: base and exponent.")
+
     @v_args(inline = True, meta = True)
     def funccall(self, meta, name, args=None):
         if name == "lag":
@@ -454,7 +470,10 @@ class GetValueFromData(Transformer):
             else:
                 args = args.children
             if requiresRandomKey(functionMap[name]):
-                return functionMap[name](jax.random.key(0), *args)
+                if self.randomKey is None:
+                    raise ValueError(f"Function '{name}' requires a random key, but none was provided.")
+                self.randomKey, subkey = jax.random.split(self.randomKey)
+                return functionMap[name](subkey, *args)
             else:
                 return functionMap[name](*args)
         else:
