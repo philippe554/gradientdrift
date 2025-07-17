@@ -36,17 +36,17 @@ jobs:
       - name: Install "Oldest" Dependencies
         if: matrix.dependency-set == 'oldest'
         run: |
-          pip install -e . "jax==0.4.34" "jaxlib==0.4.34" "optax==0.2.4" "numpy==1.24.1" "scipy==1.10.1" "lark==1.1.5" pytest
+          pip install -e . "jax==0.4.34" "jaxlib==0.4.34" "optax==0.2.4" "numpy==1.24.1" "scipy==1.10.1" "lark==1.1.5" pytest arch
 
       - name: Install dependencies from 2025
         if: matrix.dependency-set == '2025'
         run: |
-          pip install -e . "jax==0.6.2" "jaxlib==0.6.2" "optax==0.2.5" "numpy==2.2.6" "scipy==1.15.3" "lark==1.2.2" pytest
+          pip install -e . "jax==0.6.2" "jaxlib==0.6.2" "optax==0.2.5" "numpy==2.2.6" "scipy==1.15.3" "lark==1.2.2" pytest arch
 
       - name: Install latest dependencies
         if: matrix.dependency-set == 'latest'
         run: |
-          pip install -e . jax jaxlib optax numpy scipy lark pytest
+          pip install -e . jax jaxlib optax numpy scipy lark pytest arch
 
       - name: Display installed versions
         run: |
