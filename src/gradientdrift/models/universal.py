@@ -7,7 +7,8 @@ from functools import partial
 
 from gradientdrift.models.model import Model
 from gradientdrift.utils.formulawalkers import *
-from gradientdrift.utils.formulaparsers import ModelFormulaParser, ModelFormulaReconstructor
+from gradientdrift.utils.formulaparsers import getParser, ModelFormulaReconstructor
+from gradientdrift.utils.functionmap import isDistributionFunction
 
 class Universal(Model):
     def __init__(self, formula):
@@ -15,7 +16,7 @@ class Universal(Model):
 
     def constructModel(self, formula, key = jax.random.PRNGKey(42)):
         # Tokenize the formula
-        formulaTree = ModelFormulaParser.parse(formula)
+        formulaTree = getParser().parse(formula)
         formulaTree = RemoveNewlines().transform(formulaTree)
         
         statements = formulaTree.children
@@ -26,7 +27,7 @@ class Universal(Model):
         self.formulas = [{"tokens" : s} for s in statements if s.data == 'formula']
         self.optimize = [{"tokens" : s} for s in statements if s.data == 'optimize']
 
-        # Process parameter definitions
+        # Process parameter definitions (should come first)
         self.parameters = {}
         parameterDefinitionsFound = set()
         for i, definition in enumerate(parameterDefinition):
@@ -45,7 +46,7 @@ class Universal(Model):
                     for name in names:
                         self.parameters[name]["tokens"] = rhs
                     
-        # Process constraints
+        # Process constraints (order independent)
         self.parameterizations = {}
         for i, constraint in enumerate(constraintDefinitions):
             if constraint["tokens"].children[0].data == "boundconstraint":
@@ -76,8 +77,76 @@ class Universal(Model):
             initialization["name"] = initialization["tokens"].children[0].value
             initialization["index"] = int(initialization["tokens"].children[1].value)
             initialization["value"] = initialization["tokens"].children[2]
+  
+        # Process formulas (insert parameters and split into assignments and optimizations)
+        for i, formula in enumerate(self.formulas):
+            lhs, rhs = formula["tokens"].children
 
-        # Process assignments
+            if rhs.data == "funccall" and isDistributionFunction(rhs.children[0].value):
+                rhsIsProbabilistic = True
+            else:
+                rhsIsProbabilistic = False
+
+            # Name unnamed parameters
+            parameters = GetParameters().transform(rhs)
+            rhs = NameUnnamedParameters(parameters).transform(rhs)
+
+            # If no parameters found, auto insert them in the top level sum
+            if not rhsIsProbabilistic:               
+                parameters = GetParameters().transform(rhs)
+
+                if len(parameters) == 0: # No parameters found, automatic mode
+                    LabelOuterSum().visit(rhs)
+                    rhs = InsertParameters().transform(rhs)
+                    parameters = GetParameters().transform(rhs)
+                    if len(parameters) == 0:
+                        raise ValueError("No parameters found in the formula. Please ensure the formula is correctly specified.")
+                    if len(set(parameters)) != len(parameters):
+                        raise ValueError("Duplicate parameters found in the formula. Please ensure each parameter is unique.")
+            
+            
+            # Split the formula in an assignment and an optimization function
+            dependingVariables = [e.children[0].value for e in lhs.children]
+            if rhsIsProbabilistic:
+                if len(dependingVariables) != 1:
+                    raise ValueError(f"Probabilistic formula must have exactly one depending variable. Found: {len(dependingVariables)} depending variables.")
+                
+                distributionName = rhs.children[0].value
+                if distributionName == "normal":
+                    args = rhs.children[1].children
+                    if len(args) != 2:
+                        raise ValueError(f"Normal distribution must have exactly two arguments: mean and standard deviation. Found: {len(args)} arguments.")
+
+                    rhsReconstructed = ModelFormulaReconstructor.reconstruct(rhs)
+                    self.assignments.append({
+                        "tokens": getParser("assignment").parse(
+                            f"{dependingVariables[0]} = {rhsReconstructed}"
+                        )
+                    })
+                    
+                    meanReconstructed = ModelFormulaReconstructor.reconstruct(copy.deepcopy(args[0]))
+                    stdReconstructed = ModelFormulaReconstructor.reconstruct(copy.deepcopy(args[1]))
+                    tokens = getParser("optimize").parse(
+                        "maximize: norm.logpdf(" + dependingVariables[0] + ", " + meanReconstructed + ", " + stdReconstructed + ")"
+                    )
+                    self.optimize.append({"tokens": tokens})
+                else:
+                    raise ValueError(f"Unsupported distribution '{distributionName}' in the formula. Supported distributions are: normal, uniform, poisson, binomial, exponential, gamma, beta, cauchy, laplace, lognormal.")
+            else:
+                rhsReconstructed = ModelFormulaReconstructor.reconstruct(rhs)
+                self.assignments.append({
+                    "tokens": getParser("assignment").parse(
+                        f"{dependingVariables[0]} = {rhsReconstructed}"
+                    )
+                })
+
+                for dependingVariable in dependingVariables:
+                    tokens = getParser("optimize").parse(
+                        "maximize: norm.logpdf(" + dependingVariable + ", model." + dependingVariable + ", {" + dependingVariable + "_sigma})"
+                    )
+                    self.optimize.append({"tokens": tokens})
+
+        # Process assignments (should come after formulas)
         for i, assignment in enumerate(self.assignments):
             lhs, rhs = assignment["tokens"].children
 
@@ -110,60 +179,8 @@ class Universal(Model):
             # Finalize the formula tokens
             rhsReconstructed = ModelFormulaReconstructor.reconstruct(copy.deepcopy(rhs))
             print(assignment["name"], "=", rhsReconstructed)
-            
-        # Process formulas
-        for i, formula in enumerate(self.formulas):
-            lhs, rhs = formula["tokens"].children
-
-            # Get depending variables and data columns
-            formula["dependingVariables"] = [e.children[0].value for e in lhs.children]
-
-            # Get data padding
-            SetLeafNodeLags().visit(rhs)
-            formula["maxDataLag"] = GetMaxLag().transform(rhs)
-            formula["maxMALag"] = 0
-            formula["leftPadding"] = max(formula["maxDataLag"], formula["maxMALag"])
-            formula["rightPadding"] = 0
-
-            # Get parameters names
-            parameters = GetParameters().transform(rhs)
-            rhs = NameUnnamedParameters(parameters).transform(rhs)
-            parameters = GetParameters().transform(rhs)
-
-            if len(parameters) == 0: # No parameters found, automatic mode
-                LabelOuterSum().visit(rhs)
-                rhs = InsertParameters().transform(rhs)
-                parameters = GetParameters().transform(rhs)
-                if len(parameters) == 0:
-                    raise ValueError("No parameters found in the formula. Please ensure the formula is correctly specified.")
-                if len(set(parameters)) != len(parameters):
-                    raise ValueError("Duplicate parameters found in the formula. Please ensure each parameter is unique.")
-                parameters = set(parameters)
-
-            # Get parameters shapes
-            parameterShapesGetter = GetParameterShapes(len(formula["dependingVariables"]))
-            outputShape = parameterShapesGetter.transform(rhs)
-            if len(outputShape) == 1 and outputShape[0] == len(formula["dependingVariables"]):
-                shapes = parameterShapesGetter.parameterShapes
-                for name, shape in shapes.items():
-                    if name not in self.parameters:
-                        self.parameters[name] = {"shape": shape}
-                    else:
-                        if "shape" not in self.parameters[name]:
-                            self.parameters[name]["shape"] = shape
-                        elif self.parameters[name]["shape"] != shape:
-                            raise ValueError(f"Parameter '{name}' has inconsistent shapes: {self.parameters[name]['shape']} vs {shape}.")
-            else:
-                raise ValueError(f"Output shape {outputShape[0]} is not compatible with the model.")
-            
-            # Insert back into the object
-            formula["tokens"].children = [lhs, rhs]
-
-            # Finalize the formula tokens
-            lhsReconstructed = ModelFormulaReconstructor.reconstruct(copy.deepcopy(lhs))
-            rhsReconstructed = ModelFormulaReconstructor.reconstruct(copy.deepcopy(rhs))
-            print(lhsReconstructed, "~", rhsReconstructed)
-
+          
+        # Process optimization functions (should come after formulas)
         for i, optimize in enumerate(self.optimize):
             optimize["type"] = optimize["tokens"].children[0].value
             if optimize["type"] not in ["minimize", "maximize"]:
@@ -193,6 +210,7 @@ class Universal(Model):
             reconstructed = ModelFormulaReconstructor.reconstruct(copy.deepcopy(sum))
             print(optimize['type'] + ":", reconstructed)
 
+        # Initialize parameters (should come after all formulas and assignments)
         keys = jax.random.split(key, len(self.parameters))
         self.parameterConstants = {}
         self.parameterValues = {}
@@ -225,10 +243,8 @@ class Universal(Model):
                 raise ValueError(f"Constant parameter '{name}' contains NaN or infinite values. Please check the parameter initialization.")
 
         # Get global properties
-        self.leftPadding = max([formula["leftPadding"] for formula in self.formulas] + 
-                               [assignment["leftPadding"] for assignment in self.assignments])
-        self.rightPadding = max([formula["rightPadding"] for formula in self.formulas] + 
-                                [assignment["rightPadding"] for assignment in self.assignments])
+        self.leftPadding = max([assignment["leftPadding"] for assignment in self.assignments])
+        self.rightPadding = max([assignment["rightPadding"] for assignment in self.assignments])
         
         # Initialize data columns to None, in case predict is called as a standalone method
         self.dataColumns = None
@@ -262,20 +278,20 @@ class Universal(Model):
                 parameterName = name["name"]
                 index = name["index"]
                 valueGetter = GetValueFromData(
-                    params = params, constants = self.parameterConstants, parameterizations = self.parameterizations)
+                    params = params, constants = self.parameterConstants, parameterizations = self.parameterizations
+                )
                 initialValue = valueGetter.transform(name["value"])
                 if parameterName in states:
                     states[parameterName] = states[parameterName].at[index, :].set(initialValue)
                 else:
                     raise ValueError(f"Initialization parameter '{parameterName}' not found in assignments. Please ensure the parameter is defined in the formula.")
             
-            responses = {i: jnp.zeros((dataLength, len(formula["dependingVariables"]))) for i, formula in enumerate(self.formulas)}
-            initialCarry = (states, responses, randomKey)
+            initialCarry = (states, randomKey)
 
             def forward(carry, t0):
-                states, responses, randomKey = carry
+                states, randomKey = carry
 
-                for i, assignment in enumerate(self.assignments):
+                for assignment in self.assignments:
                     oldValue = states[assignment["name"]][t0, :]
 
                     valueGetter = GetValueFromData(
@@ -288,63 +304,36 @@ class Universal(Model):
                     value = jnp.where(t0 >= assignment["leftPadding"], newValue, oldValue)
                     states[assignment["name"]] = states[assignment["name"]].at[t0, :].set(value)
 
-                for i, formula in enumerate(self.formulas):
-                    oldValue = responses[i][t0, :]
-
-                    valueGetter = GetValueFromData(
-                        params = params, constants = self.parameterConstants, data = data, dataColumns = self.dataColumns, 
-                        t0 = t0, states = states, parameterizations = self.parameterizations,
-                        randomKey = randomKey)
-                    newValue = valueGetter.transform(formula["tokens"].children[1])
-                    randomKey = valueGetter.randomKey
-
-                    value = jnp.where(t0 >= formula["leftPadding"], newValue, oldValue)
-                    responses[i] = responses[i].at[t0, :].set(value)
-
-                carry = states, responses, randomKey
+                carry = states, randomKey
 
                 return carry, {}
 
             finalCarry, _ = lax.scan(forward, initialCarry, jnp.arange(dataLength))
-            states, responses, randomKey = finalCarry
+            states, randomKey = finalCarry
 
         else:
             # TODO: add random key support for batched forward pass
 
             def forward(t0):
                 states = {}
-                responses = {}
 
-                for i, assignment in enumerate(self.assignments):
+                for assignment in self.assignments:
                     valueGetter = GetValueFromData(
                         params = params, constants = self.parameterConstants, data = data, dataColumns = self.dataColumns, 
                         t0 = t0, statesT0 = states, parameterizations = self.parameterizations)
                     value = valueGetter.transform(assignment["tokens"].children[1])
                     states[assignment["name"]] = value
 
-                for i, formula in enumerate(self.formulas):
-                    valueGetter = GetValueFromData(
-                        params = params, constants = self.parameterConstants, data = data, dataColumns = self.dataColumns, 
-                        t0 = t0, statesT0 = states, parameterizations = self.parameterizations)
-                    value = valueGetter.transform(formula["tokens"].children[1])
-                    responses[i] = value
-
-                return states, responses
+                return states
             
             batchedForward = jax.vmap(forward)
-            states, responses = batchedForward(jnp.arange(dataLength))
+            states = batchedForward(jnp.arange(dataLength))
 
-        return states, responses
+        return states
 
     @partial(jax.jit, static_argnames=["self", "returnLossPerSample"])
     def loss(self, params, data, returnLossPerSample = False):
-        states, responses = self.predict(params, data)
-
-        # for stateName, state in states.items():
-        #     print(f"State '{stateName}' shape: {jnp.shape(state)}")
-
-        # for i, response in responses.items():
-        #     print(f"Response {i} shape: {jnp.shape(response)}")
+        states = self.predict(params, data)
 
         losses = []
 
