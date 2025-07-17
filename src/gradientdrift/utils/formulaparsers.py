@@ -39,7 +39,7 @@ formulaGrammar = r"""
     ?exponent: atom ("^" NEWLINE* atom)?
 
     ?atom: (NUMBER | "-" NUMBER) -> number
-         | NAME -> variable
+         | variable
          | parameter
          | funccall
          | "(" NEWLINE* sum NEWLINE* ")"
@@ -47,6 +47,8 @@ formulaGrammar = r"""
     funccall: FUNCNAME "(" NEWLINE* [arguments NEWLINE*] ")"
     arguments: sum ("," NEWLINE* sum)*
     parameter: "{" NEWLINE* [NAME NEWLINE*] "}"
+    variable: variablenamespace? NAME
+    variablenamespace: NAME "." 
 
     FUNCNAME: /[a-zA-Z0-9.]+/
 
@@ -56,6 +58,11 @@ formulaGrammar = r"""
     %ignore WS_INLINE
 """
 
-ModelFormulaParser = Lark(formulaGrammar, start='model', maybe_placeholders = False)
+parserCache = {}
+def getParser(start = 'model'):
+    if start not in parserCache:
+        parserCache[start] = Lark(formulaGrammar, start=start, maybe_placeholders=False)
+    return parserCache[start]
 
-ModelFormulaReconstructor = Reconstructor(ModelFormulaParser)
+
+ModelFormulaReconstructor = Reconstructor(getParser())

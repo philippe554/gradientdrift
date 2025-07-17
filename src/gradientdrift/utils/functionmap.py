@@ -43,6 +43,9 @@ def getFunctionMap():
     for ns in namespaces:
         recursiveSearchForFunctions(ns)
 
+    # TODO: temporary fix for normal distribution
+    functionMap["normal"] = lambda key, mean=0.0, stddev=1.0: jax.random.normal(key, shape=(), dtype=jax.numpy.float32) * stddev + mean
+
     return functionMap
 
 def requiresRandomKey(func):
@@ -57,3 +60,11 @@ def requiresRandomKey(func):
         pass
     
     return False
+
+def isDistributionFunction(funcName):
+    distributionFunctions = [
+        "normal", "uniform", "poisson", "binomial", "exponential",
+        "gamma", "beta", "cauchy", "laplace", "lognormal"
+    ]
+    
+    return funcName in distributionFunctions

@@ -86,6 +86,7 @@ class GetMaxLag(Transformer):
         return max(children)
     @v_args(meta = True)
     def variable(self, meta, children): return meta.lag
+    def variablenamespace(self, children): return 0
     def number(self, children): return 0
     def parameter(self, children): return 0
     def operator(self, children): return 0
@@ -208,6 +209,7 @@ class GetParameterShapes(Transformer):
         else:
             raise ValueError("No children found. Please ensure the formula is correctly structured.")
     def variable(self, items): return (1,)
+    def variablenamespace(self, items): return (1,)
     def number(self, items): return (1,)
     def parameter(self, items): return items[0].value
     @v_args(inline = True)
