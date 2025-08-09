@@ -3,6 +3,9 @@ from lark.reconstruct import Reconstructor
 
 formulaGrammar = r"""
 
+    specification: NEWLINE* namedmodel (NEWLINE+ namedmodel)* NEWLINE*
+    namedmodel: NAME ":" NEWLINE* model
+
     model: NEWLINE* statement (NEWLINE+ (statement))* NEWLINE*
     
     ?statement: (parameterdefinition | formula | initialization | assignment | optimize | constraint)
@@ -10,7 +13,7 @@ formulaGrammar = r"""
     formula: dependingvariables "~" NEWLINE* sum
 
     initialization: NAME "[" NEWLINE* NUMBER NEWLINE* "]" "=" NEWLINE* sum
-    assignment: NAME "=" NEWLINE* sum
+    assignment: sum "=" NEWLINE* sum
     
     parameterdefinition: ("const")? parameterlist ("=" NEWLINE* (sum | shape))+
     parameterlist: parameter ("," NEWLINE* parameter)*
@@ -29,16 +32,16 @@ formulaGrammar = r"""
     dependingvariables: sum ("," sum)*
 
     ?sum: product (sumoperator NEWLINE* product)*
-    ?sumoperator: SUMOPERATOR -> operator
+    sumoperator: SUMOPERATOR -> operator
     SUMOPERATOR: "+" | "-"
 
     ?product: exponent (productopertor NEWLINE* exponent)*
-    ?productopertor: PRODUCTOPERATOR -> operator
+    productopertor: PRODUCTOPERATOR -> operator
     PRODUCTOPERATOR: "*" | "/" | "@"
 
     ?exponent: atom ("^" NEWLINE* atom)?
 
-    ?atom: (NUMBER | "-" NUMBER) -> number
+    ?atom: SIGNED_NUMBER -> number
          | variable
          | parameter
          | funccall
@@ -46,14 +49,14 @@ formulaGrammar = r"""
 
     funccall: FUNCNAME "(" NEWLINE* [arguments NEWLINE*] ")"
     arguments: sum ("," NEWLINE* sum)*
-    parameter: "{" NEWLINE* [NAME NEWLINE*] "}"
-    variable: variablenamespace? NAME
-    variablenamespace: NAME "." 
+    parameter: "{" NEWLINE* NAME ("." NAME)? NEWLINE* "}"
+    variable: NAME ("." NAME)?
 
     FUNCNAME: /[a-zA-Z0-9.]+/
 
     %import common.CNAME -> NAME
     %import common.NUMBER
+    %import common.SIGNED_NUMBER
     %import common.WS_INLINE
     %ignore WS_INLINE
 """
@@ -61,7 +64,7 @@ formulaGrammar = r"""
 parserCache = {}
 def getParser(start = 'model'):
     if start not in parserCache:
-        parserCache[start] = Lark(formulaGrammar, start=start, maybe_placeholders=False)
+        parserCache[start] = Lark(formulaGrammar, start = start, maybe_placeholders = False)
     return parserCache[start]
 
 

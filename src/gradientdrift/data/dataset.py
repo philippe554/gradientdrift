@@ -34,6 +34,9 @@ class Dataset:
         self.rightPadding = 0
         self.batches = []
 
+    def getDataColumns(self):
+        return self.columns
+
     def setData(self, data):
         self.data = data
 

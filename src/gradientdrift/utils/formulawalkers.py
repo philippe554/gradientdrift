@@ -25,19 +25,54 @@ class RemoveNewlines(Transformer):
     def __default__(self, data, children, meta):
         children = [child for child in children if not (isinstance(child, Token) and child.type == 'NEWLINE')]
         return Tree(data, children, meta)
-                
-class GetDataFields(Transformer):
-    """A transformer to find all unique data fields (variables) used in a formula."""
+    
+class FlattenNamespaces(Transformer):
     def __default__(self, data, children, meta):
-        return set().union(*children)
-    def variable(self, items): return {items[0].value}
-    def number(self, items): return set()
-    def parameter(self, items): return set()
-    @v_args(inline = True)
-    def funccall(self, name, args=None):
-        return args if args is not None else set()
-    def operator(self, items):
-        return set()
+        if data == 'variable':
+            if len(children) == 1 and isinstance(children[0], Token) and children[0].type == 'NAME':
+                return Tree(data, [children[0]], meta)
+            elif len(children) == 2 and isinstance(children[0], Token) and children[0].type == 'NAME':
+                return Tree(data, [Token('NAME', f"{children[0].value}.{children[1].value}")], meta)
+            else:
+                raise ValueError(f"Unexpected children for variable: {children}")
+        elif data == 'parameter':
+            if len(children) == 1 and isinstance(children[0], Token) and children[0].type == 'NAME':
+                return Tree(data, [children[0]], meta)
+            elif len(children) == 2 and isinstance(children[0], Token) and children[0].type == 'NAME':
+                return Tree(data, [Token('NAME', f"{children[0].value}.{children[1].value}")], meta)
+            else:
+                raise ValueError(f"Unexpected children for parameter: {children}")
+        else:
+            return Tree(data, children, meta)
+        
+class AddNamespace(Transformer):
+    def __init__(self, dataColumns = [], modelNamespace = "model"):
+        super().__init__()
+        self.dataColumns = dataColumns
+        self.modelNamespace = modelNamespace
+
+    def __default__(self, data, children, meta):
+        if data == 'variable':
+            if "." not in children[0].value:
+                if children[0].value in self.dataColumns:
+                    return Tree(data, [Token('NAME', f"data.{children[0].value}")], meta)
+                else:
+                    return Tree(data, [Token('NAME', f"{self.modelNamespace}.{children[0].value}")], meta)
+            else:
+                if self.modelNamespace != "model" and children[0].value.startswith("model."):
+                    return Tree(data, [Token('NAME', f"{self.modelNamespace}.{children[0].value[6:]}")], meta)
+                else:
+                    return Tree(data, children, meta)
+        elif data == 'parameter':
+            if "." not in children[0].value:
+                return Tree(data, [Token('NAME', f"{self.modelNamespace}.{children[0].value}")], meta)
+            else:
+                if self.modelNamespace != "model" and children[0].value.startswith("model."):
+                    return Tree(data, [Token('NAME', f"{self.modelNamespace}.{children[0].value[6:]}")], meta)
+                else:
+                    return Tree(data, children, meta)
+        else:
+            return Tree(data, children, meta)
     
 class SetLeafNodeLags(Interpreter):
     """A visitor to set the lag for leaf nodes in a formula."""
@@ -51,7 +86,7 @@ class SetLeafNodeLags(Interpreter):
                     self.visit(arg)
 
     @v_args(inline = True, meta = True)
-    def funccall(self, meta, name, args=None):
+    def funccall(self, meta, name, args):
         if not hasattr(meta, 'lag'):
             meta.lag = 0
         if name == 'lag':
@@ -86,7 +121,6 @@ class GetMaxLag(Transformer):
         return max(children)
     @v_args(meta = True)
     def variable(self, meta, children): return meta.lag
-    def variablenamespace(self, children): return 0
     def number(self, children): return 0
     def parameter(self, children): return 0
     def operator(self, children): return 0
@@ -104,6 +138,18 @@ class GetParameters(Transformer):
     def variable(self, items): return []
     def number(self, items): return []
     def parameter(self, items): return [items[0].value] if items else []
+    def operator(self, items): return []
+    @v_args(inline = True)
+    def funccall(self, name, args=None):
+        return args if args is not None else []
+    
+class GetVariables(Transformer):
+    """A transformer to find all unique variable names used in a formula."""
+    def __default__(self, data, children, meta):
+        return [item for sublist in children for item in sublist]
+    def variable(self, items): return [items[0].value]
+    def number(self, items): return []
+    def parameter(self, items): return []
     def operator(self, items): return []
     @v_args(inline = True)
     def funccall(self, name, args=None):
@@ -136,15 +182,15 @@ class NameUnnamedParameters(Transformer):
             
             if len(otherChildren) == 0 or len(otherChildren) != len(children) - 2:
                 raise ValueError("Unexpected structure in children. Please ensure the formula is correctly structured.")
-            otherTree = Tree(data, otherChildren, meta)
+            otherTree = Tree(data, otherChildren, copy.deepcopy(meta))
             parameterName = getParameterName(otherTree)
             
             if parameterName in self.existingParameters:
                 raise ValueError(f"Parameter name '{parameterName}' already exists. Please ensure all parameters have unique names.")
             self.existingParameters.add(parameterName)
-            
-            children[unnamedIndices[0]] = Tree("parameter", [Token('NAME', parameterName)], meta)
-            return Tree(data, children, meta)
+
+            children[unnamedIndices[0]] = Tree(Token("RULE", "parameter"), [Token('NAME', parameterName)], copy.deepcopy(meta))
+            return Tree(data, children, copy.deepcopy(meta))
 
 class InsertParameters(Transformer):
     """
@@ -163,34 +209,90 @@ class InsertParameters(Transformer):
                     parameter = Tree(
                         Token('RULE', 'parameter'), [
                             Token('NAME', parameterName)
-                        ],
-                        meta
+                        ]
                     )
 
                     operator = Tree(
                         "operator", [
                             Token('PRODUCTOPERATOR', '@')
-                        ],
-                        meta
+                        ]
                     )
 
-                    insertedItems.append(Tree("product", [parameter, operator, children[i]], meta))
+                    insertedItems.append(Tree(Token("RULE", "product"), [parameter, operator, children[i]]))
                 else:
                     if children[i].data == 'operator':
                         insertedItems.append(children[i])
                     else:
                         raise ValueError(f"Unexpected item in sum: {children[i]}")
 
-            return Tree("sum", insertedItems, meta)
+            return Tree(Token("RULE", "sum"), insertedItems)
         else:
-            return Tree("sum", children, meta)
-        
+            return Tree(Token("RULE", "sum"), children)
+
     @v_args(meta = True)
     def parameter(self, meta, children):
         if children:
-            return Tree("parameter", children, meta)
+            return Tree(Token("RULE", "parameter"), children)
         else:
             raise ValueError("Unnamed parameter found. Please ensure all parameters are named.")
+
+class RemoveMeta(Transformer):
+    def __default__(self, data, children, meta):
+        return Tree(data, children)
+
+class ExpandFunctions(Transformer):
+    """
+    Expands functions like diff, AR, MA, etc. to their full form.
+    """
+    @v_args(inline = True, meta = True)
+    def funccall(self, meta, name, args=None):
+        if name == "residuals":
+            if args is None or len(args.children) != 1:
+                raise ValueError("Function 'residuals' requires exactly one argument.")
+            residualName = args.children[0].children[0].value
+            if "." in residualName:
+                namespace = residualName.split(".")[0]
+                variable = residualName.split(".")[1]
+                data = f"data.{variable}"
+                variable = f"{namespace}.{variable}"
+            else:
+                data = "data." + residualName
+                variable = residualName
+
+            return Tree(
+                Token("RULE", "sum"),
+                [
+                    Tree(Token("RULE", "variable"), [Token('NAME', variable)]),
+                    Tree("operator", [Token('SUMOPERATOR', '-')]),
+                    Tree(Token("RULE", "variable"), [Token('NAME', data)])
+                ]
+            )
+        
+        elif name == "diff":
+            if args is None or len(args.children) != 1:
+                raise ValueError("Function 'diff' requires exactly one argument.")
+            
+            element = RemoveMeta().transform(args.children[0])
+
+            laggedElement = Tree(
+                Token("RULE", "funccall"),
+                [
+                    Token('FUNCNAME', "lag"),
+                    Tree(Token("RULE", "arguments"), [copy.deepcopy(element)])
+                ]
+            )
+
+            return Tree(
+                Token("RULE", "sum"),
+                [
+                    copy.deepcopy(element),
+                    Tree("operator", [Token('SUMOPERATOR', '-')]),
+                    laggedElement
+                ]
+            )
+
+        else:
+            return Tree(Token("RULE", "funccall"), [name, args] if args else [name])
 
 class GetParameterShapes(Transformer):
     def __init__(self, outputLength):
@@ -209,7 +311,6 @@ class GetParameterShapes(Transformer):
         else:
             raise ValueError("No children found. Please ensure the formula is correctly structured.")
     def variable(self, items): return (1,)
-    def variablenamespace(self, items): return (1,)
     def number(self, items): return (1,)
     def parameter(self, items): return items[0].value
     @v_args(inline = True)
@@ -219,7 +320,7 @@ class GetParameterShapes(Transformer):
         if type(args) is not list:
             args = [args]
 
-        if name == "lag":
+        if name == "lag" or name == "diff" or name == "residuals":
             return args[0]
         elif name == "MA" or name == "AR":
             lags = int(args[0])
@@ -323,6 +424,7 @@ class GetParameterShapes(Transformer):
         return self.aggregate(children)
     def arguments(self, children):
         return children
+
 class GetValueFromData(Transformer):
     """
     A transformer to calculate the numerical value of a formula expression.
@@ -348,20 +450,27 @@ class GetValueFromData(Transformer):
     @v_args(meta = True)
     def variable(self, meta, children):
         variableName = children[0].value
-        if self.dataColumns and variableName in self.dataColumns:
-            t = self.t0 - meta.lag
-            variableIndex = self.dataColumns.index(variableName)
-            return self.data[t, variableIndex]
-        elif self.statesT0 and variableName in self.statesT0:
-            if meta.lag != 0:
-                raise ValueError(f"Variable '{variableName}' is defined in states but cannot be accessed with a lag. Please ensure it is defined in the formula without a lag.")
-            return self.statesT0[variableName]
-        elif self.states and variableName in self.states:
-            t = self.t0 - meta.lag
-            if variableName in self.states:
-                return self.states[variableName][t, :]
+        if "." not in variableName:
+            raise ValueError(f"Variable '{variableName}' is not fully qualified. Please ensure it includes the namespace.")
+        if variableName.startswith("data."):
+            variableName = variableName[5:]  # Remove 'data.' prefix
+            if self.dataColumns and variableName in self.dataColumns:
+                t = self.t0 - meta.lag
+                variableIndex = self.dataColumns.index(variableName)
+                return self.data[t, variableIndex]
+            else:
+                raise ValueError(f"Variable '{variableName}' not found in data columns. Please ensure it is defined in the formula.")
         else:
-            raise ValueError(f"Variable '{variableName}' not found in data or states. Please ensure it is defined in the formula.")
+            if self.statesT0 and variableName in self.statesT0:
+                if meta.lag != 0:
+                    raise ValueError(f"Variable '{variableName}' is defined in states but cannot be accessed with a lag. Please ensure it is defined in the formula without a lag.")
+                return self.statesT0[variableName]
+            elif self.states and variableName in self.states:
+                t = self.t0 - meta.lag
+                if variableName in self.states:
+                    return self.states[variableName][t, :]
+                
+            raise ValueError(f"Variable '{variableName}' not found in states. Please ensure it is defined in the formula.")
     
     def number(self, children):
         if children:

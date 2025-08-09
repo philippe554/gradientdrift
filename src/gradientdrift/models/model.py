@@ -9,16 +9,31 @@ import jax.numpy as jnp
 from functools import partial
 
 class Model:
-    def fitClosedForm(self, dataset, batchSize = 100):
-        raise NotImplementedError("This method should be implemented in subclasses.")
-    
+    def predict(self, dataset = None, steps = None, key = jax.random.PRNGKey(42)):
+        key1, key2 = jax.random.split(key)
+        if dataset is not None:
+            self.constructModel(dataset.getDataColumns(), key1)
+            states = self.predictStep(self.parameterValues, randomKey = key2, data = dataset.data)
+        else:
+            self.constructModel([], key1)
+            states = self.predictStep(self.parameterValues, randomKey = key2, steps = steps)
+        states = {k.replace("model.", ""): v for k, v in states.items()}
+        return states
+
+    def loss(self, dataset, returnLossPerSample = False):
+        if dataset is None:
+            raise ValueError("Dataset must be provided to compute loss.")
+        self.constructModel(dataset.getDataColumns())
+        return self.lossStep(self.parameterValues, dataset.data, returnLossPerSample)
+
     def fit(self, dataset, seed = 42, batchSize = -1, maxNumberOfSteps = 1000, parameterUpdateFrequency = -1, optimizer = "ADAM"):
         try:
             key = jax.random.PRNGKey(seed)
+
+            self.constructModel(dataset.getDataColumns(), key)
             
             if optimizer.lower() == "closedform":
-                self.fitClosedForm(dataset, batchSize)
-                return
+                raise ValueError("Closed-form optimization is not implemented.")
 
             fitStartTime = datetime.datetime.now()
 
@@ -61,7 +76,7 @@ class Model:
             if not optimizerUsesState:
                 @jax.jit
                 def calcGrad(params, batch):
-                    loss, grads = jax.value_and_grad(self.loss)(params, batch)
+                    loss, grads = jax.value_and_grad(self.lossStep)(params, batch)
                     return loss, grads
                 
                 @jax.jit
@@ -73,13 +88,13 @@ class Model:
             else:
                 @jax.jit
                 def calcGradWithState(params, batch, optimizerState):
-                    loss, grads = optax.value_and_grad_from_state(self.loss)(params, batch, state = optimizerState)
+                    loss, grads = optax.value_and_grad_from_state(self.lossStep)(params, batch, state = optimizerState)
                     return loss, grads
                 
                 @jax.jit
                 def applyUpdateWithLineSearch(grads, params, optState, loss, batches):
                     def lossOverBatches(params):
-                        batchLosses = jax.vmap(self.loss, in_axes=(None, 0))(params, batches)
+                        batchLosses = jax.vmap(self.lossStep, in_axes=(None, 0))(params, batches)
                         return jax.numpy.mean(batchLosses)
                     
                     updates, newOptState = optimizerObj.update(
@@ -136,11 +151,22 @@ class Model:
                 for i in range(numberOfBatches):
                     selectedBatches.append(batchOrder[i])
                     batch = dataset.getBatch(batchOrder[i])
-                    
+
+                    # jaxpr = jax.make_jaxpr(self.lossStep)(self.parameterValues, batch.data)
+                    # print(jaxpr)
+                    # exit()
+
                     if not optimizerUsesState:
                         loss, grads = calcGrad(self.parameterValues, batch.data)
                     else:
                         loss, grads = calcGradWithState(self.parameterValues, batch.data, optimizerState)
+
+                    lossContainsNaN = jnp.any(jnp.isnan(loss))
+                    gradContainsNaN = any(jnp.any(jnp.isnan(g)) for g in jax.tree_util.tree_leaves(grads))
+                    if lossContainsNaN or gradContainsNaN:
+                        print(f"\n\nError: Loss or gradients contain NaN at step {step + 1}, batch {i + 1}.")
+                        print(f"Gradients: {grads}")
+                        exit(1)
 
                     stepLoss += loss * batch.getEffectiveNObs()
                     stepGrads = jax.tree_util.tree_map(jax.numpy.add, stepGrads, grads)
@@ -184,9 +210,6 @@ class Model:
         self.fitConfig["Fit end time"] = fitEndTime.strftime("%a, %d %b %Y %H:%M:%S")
         self.fitConfig["Fit duration"] = str(fitEndTime - fitStartTime)
 
-    def loss(self, params, data):
-        raise NotImplementedError("This method should be implemented in subclasses.")
-    
     def constructModel(self):
         _, self.unflattenFunc = jax.flatten_util.ravel_pytree(self.parameterValues)
     
@@ -200,12 +223,12 @@ class Model:
     def calculateHessianAndOPGMatrix(self, params, dataset):
         hessianFunc = jax.jit(
             jax.hessian(
-                lambda p, d: self.loss(self.unflattenParameters(p), d)
+                lambda p, d: self.lossStep(self.unflattenParameters(p), d)
             )
         )
         jacobianFunc = jax.jit(
             jax.jacfwd(
-                lambda p, d: self.loss(self.unflattenParameters(p), d, returnLossPerSample = True)
+                lambda p, d: self.lossStep(self.unflattenParameters(p), d, returnLossPerSample = True)
             )
         )
 
@@ -254,7 +277,9 @@ class Model:
 
             return variableName + "[" + ".".join(template) + "]"
 
-    def summary(self, dataset, trueParams = None):
+    def summary(self, dataset, trueParams = None, confidenceLevel = 0.95):
+        self.allInConfidenceInterval = True
+
         standardErrors = self.getStdErrs(dataset)
         
         tableWidth = 104
@@ -279,12 +304,13 @@ class Model:
         print("=" * tableWidth)
         print("Parameter estimates")
         print("-" * tableWidth)
-        print(f"{'Parameter':<28.28} {'Estimate':>10.10} {'Std. err.':>10.10} {'t-stat.':>10.10} {'P-value':>9.9} {'Conf. interval':>21.21} {'True val':>10.10}")
+        confidenceIntervalHeader = f"Conf. int. ({confidenceLevel * 100:.1f}%)"
+        print(f"{'Parameter':<28.28} {'Estimate':>10.10} {'Std. err.':>10.10} {'t-stat.':>10.10} {'P-value':>9.9} {confidenceIntervalHeader:>21.21} {'True val':>10.10}")
 
         estimates = self.getConstraintParameters()
         tStats = self.getTStats(dataset, standardErrors = standardErrors)
         pValues = self.getPValues(dataset, standardErrors = standardErrors)
-        lowerBounds, upperBounds = self.getConfIntervals(dataset, standardErrors = standardErrors)
+        lowerBounds, upperBounds = self.getConfIntervals(dataset, standardErrors = standardErrors, confidenceLevel = confidenceLevel)
 
         for paramName, paramArray in estimates.items():
             for index, estimate in np.ndenumerate(paramArray):
@@ -292,21 +318,45 @@ class Model:
                 confInterval = f"{lowerBounds[paramName][index]:10.3f};{upperBounds[paramName][index]:10.3f}"
                 pValueSymbol = "***" if pValues[paramName][index] < 0.001 else "** " if pValues[paramName][index] < 0.01 else "*  " if pValues[paramName][index] < 0.05 else "   "
                 
-                if trueParams and paramName in trueParams:
-                    try:
-                        if np.shape(trueParams[paramName]) == ():
-                            trueValue = f"{trueParams[paramName]:10.3f}"
-                        else:
-                            trueValue = f"{trueParams[paramName][index]:10.3f}"
-                    except (IndexError, TypeError):
-                        trueValue = "N/A"
+                if trueParams:
+                    if paramName in trueParams:
+                        trueValue = trueParams[paramName]
+                    elif "." in paramName and paramName.split(".")[1] in trueParams:
+                        trueValue = trueParams[paramName.split(".")[1]]
+                    else:
+                        trueValue = None
+
+                    if trueValue is not None:
+                        inConfidenceInterval = lowerBounds[paramName][index] <= trueValue and trueValue <= upperBounds[paramName][index]
+                        if not inConfidenceInterval:
+                            self.allInConfidenceInterval = False
+                        try:
+                            if np.shape(trueValue) == ():
+                                trueValue = f"{trueValue:9.3f}"
+                            else:
+                                trueValue = f"{trueValue[index]:9.3f}"
+
+                            if inConfidenceInterval:
+                                trueValue += "*"
+                            else:
+                                trueValue += " "
+                        except (IndexError, TypeError):
+                            trueValue = "N/A "
+                    else:
+                        trueValue = "N/A "
                 else:
-                    trueValue = "N/A"
+                    trueValue = "N/A "
 
                 print(f"{paramPrettyName:<28.28} {estimate:>10.3f} {standardErrors[paramName][index]:>10.5f} {tStats[paramName][index]:>10.3f} {pValues[paramName][index]:>6.3f}{pValueSymbol} {confInterval:>21.21} {trueValue:>10.10}")
         print(" " * 31 + "P-value symbols: *** for p < 0.001, ** for p < 0.01, * for p < 0.05")
         print("=" * tableWidth)      
     
+    def isAllInConfidenceInterval(self):
+        if hasattr(self, "allInConfidenceInterval"):
+            return self.allInConfidenceInterval
+        else:
+            raise ValueError("Model does not have confidence interval information. Run Summary() first.")
+
     def getModelType(self):
         return "<TBD>"
 
@@ -408,14 +458,15 @@ class Model:
 
         return jax.tree_util.tree_map(lambda tStat: 2 * t_sf(jnp.abs(tStat), df = dof), tStat)
 
-    def getConfIntervals(self, dataset, standardErrors = None):
+    def getConfIntervals(self, dataset, standardErrors = None, confidenceLevel = 0.95):
         estimates = self.getConstraintParameters()
         if standardErrors is None:
             standardErrors = self.getStdErrs(dataset)
                 
         dof = self.getDegreesOfFreedom(dataset)
-        criticalValue = scipy.stats.t.ppf(0.975, df = dof)
-        
+
+        criticalValue = scipy.stats.t.ppf((1 + confidenceLevel) / 2, df = dof)
+
         lowerBound = jax.tree_util.tree_map(lambda estimate, se: estimate - criticalValue * se, estimates, standardErrors)
         upperBound = jax.tree_util.tree_map(lambda estimate, se: estimate + criticalValue * se, estimates, standardErrors)
         return lowerBound, upperBound
