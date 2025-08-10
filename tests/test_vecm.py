@@ -44,6 +44,7 @@ def test_vecm():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=PendingDeprecationWarning)
         from statsmodels.tsa.vector_ar.vecm import VECM
+        print("Fitting VECM model using Statsmodels...")
         X = np.column_stack((states["y1"], states["y2"]))
         model = VECM(X, deterministic = "co")
         model_fit = model.fit()

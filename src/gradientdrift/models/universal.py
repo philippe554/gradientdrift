@@ -19,6 +19,11 @@ class Universal(Model):
         self.importedParameters = {}
 
     def constructModel(self, dataColumns, key, modelName = "model"):
+        if modelName == "model":
+            print("Constructing model:")
+        else:
+            print(f"Constructing model '{modelName}':")
+
         self.dataColumns = dataColumns
         self.modelName = modelName
 
@@ -39,6 +44,7 @@ class Universal(Model):
         self.assignments = [{"tokens" : s} for s in statements if s.data == 'assignment']
         self.formulas = [{"tokens" : s} for s in statements if s.data == 'formula']
         self.optimize = [{"tokens" : s} for s in statements if s.data == 'optimize']
+        self.OLS = {}
 
         # Process parameter definitions (should come first)
         self.parameters = {}
@@ -65,10 +71,10 @@ class Universal(Model):
                     if rhs.data == "shape": # Set the shape of the parameter
                         shape = tuple([int(e.value) for e in rhs.children])
                         self.parameters[name]["shape"] = shape
-                        print(f"Parameter '{name}' shape set to {shape}.")
+                        # print(f"Parameter '{name}' shape set to {shape}.")
                     else: # Set to a constant value. A sum can flatten to multiple token types, thus match anything
                         self.parameters[name]["tokens"] = rhs
-                        print(f"Parameter '{name}' initialized to {ModelFormulaReconstructor.reconstruct(copy.deepcopy(rhs))}.")
+                        # print(f"Parameter '{name}' initialized to {ModelFormulaReconstructor.reconstruct(copy.deepcopy(rhs))}.")
 
                     
         # Process constraints (order independent)
@@ -114,7 +120,7 @@ class Universal(Model):
             rhs = AddNamespace(dataColumns = [], modelNamespace = self.modelName).transform(rhs)
             initialization["value"] = rhs
 
-            print(f"Initialization '{initialization['name']}' at index {initialization['index']} set to {ModelFormulaReconstructor.reconstruct(copy.deepcopy(initialization['value']))}.")
+            # print(f"Initialization '{initialization['name']}' at index {initialization['index']} set to {ModelFormulaReconstructor.reconstruct(copy.deepcopy(initialization['value']))}.")
   
         # Process formulas (insert parameters and split into assignments and optimizations)
         for i, formula in enumerate(self.formulas):
@@ -276,9 +282,32 @@ class Universal(Model):
                 lhsModel = AddNamespace(dataColumns = [], modelNamespace = self.modelName).transform(lhs)
                 lhsData = AddNamespace(dataColumns = self.dataColumns, modelNamespace = self.modelName).transform(lhs)
                 rhs = AddNamespace(dataColumns = self.dataColumns, modelNamespace = self.modelName).transform(rhs)
+                
+                rhs = ExpandFunctions().transform(rhs)
+                SetLeafNodeLags().visit(rhs)
+                
+                rhs = LabelDataDependencies().transform(rhs)
 
                 tokens = Tree(Token("RULE", "assignment"), [lhsModel, rhs])
                 self.assignments.append({"tokens": tokens})
+
+                if rhs.meta.dataDependency in ["linearTerm", "linearSum", "linearSumAndConstant"]:
+                    # TODO: move this to a separate function
+                    OLSTermsGetter = GetOLSTerms()
+                    OLSTermsGetter.visit(rhs)
+                    self.OLS[dependingVariable] = {
+                        "terms": OLSTermsGetter.terms,
+                        "bias": OLSTermsGetter.bias,
+                        "biasIsPositive": OLSTermsGetter.biasIsPositive,
+                        "constants": OLSTermsGetter.constants
+                    }
+
+                    for term in self.OLS[dependingVariable]["terms"]:
+                        print(f"    OLS term: {term} * {ModelFormulaReconstructor.reconstruct(copy.deepcopy(self.OLS[dependingVariable]['terms'][term]))}")
+                    if self.OLS[dependingVariable]["bias"] is not None:
+                        print(f"    OLS bias: {self.OLS[dependingVariable]['bias']}")
+                    for constant in self.OLS[dependingVariable]["constants"]:
+                        print(f"    OLS constant: {ModelFormulaReconstructor.reconstruct(copy.deepcopy(constant))}")
 
                 tokens = Tree(Token("RULE", "optimize"), [
                     Token("OPTIMIZETYPE", "maximize"),
@@ -288,7 +317,7 @@ class Universal(Model):
                             lhsModel,
                             lhsData,
                             Tree(Token("RULE", "parameter"), [
-                               Token("NAME", "model.sigma_" + dependingVariable)
+                                Token("NAME", "model.sigma_" + dependingVariable)
                             ])
                         ])
                     ])
@@ -302,7 +331,7 @@ class Universal(Model):
                 }
 
         for importedAssignment in self.importedAssignments:
-            print(f"Imported assignment: {importedAssignment['name']} = {ModelFormulaReconstructor.reconstruct(copy.deepcopy(importedAssignment['rhs']))}")
+            print(f"    Imported assignment: {importedAssignment['name']} = {ModelFormulaReconstructor.reconstruct(copy.deepcopy(importedAssignment['rhs']))}")
 
         # Process assignments (should come after formulas)
         for i, assignment in enumerate(self.assignments):
@@ -348,8 +377,10 @@ class Universal(Model):
 
             # Get data padding
             SetLeafNodeLags().visit(lhs)
+            lhsMaxLag = GetMaxLag().transform(lhs)
             SetLeafNodeLags().visit(rhs)
-            assignment["maxDataLag"] = max(GetMaxLag().transform(rhs), GetMaxLag().transform(lhs))
+            rhsMaxLag = GetMaxLag().transform(rhs)
+            assignment["maxDataLag"] = max(lhsMaxLag, rhsMaxLag)
             assignment["leftPadding"] = assignment["maxDataLag"]
             assignment["rightPadding"] = 0
 
@@ -373,7 +404,7 @@ class Universal(Model):
             # Finalize the formula tokens, deep copy to avoid modifying the original tokens
             lhsReconstructed = ModelFormulaReconstructor.reconstruct(copy.deepcopy(lhs))
             rhsReconstructed = ModelFormulaReconstructor.reconstruct(copy.deepcopy(rhs))
-            print(lhsReconstructed, "=", rhsReconstructed)
+            print("    State assignment:", lhsReconstructed, "=", rhsReconstructed)
 
             assignment["lhs"] = lhs
             assignment["rhs"] = rhs
@@ -407,7 +438,7 @@ class Universal(Model):
             
             # Finalize the formula tokens
             reconstructed = ModelFormulaReconstructor.reconstruct(copy.deepcopy(sum))
-            print(optimize['type'] + ":", reconstructed)
+            print("    " + optimize['type'] + ":", reconstructed)
 
             optimize["sum"] = sum
 
@@ -422,7 +453,7 @@ class Universal(Model):
             shape = self.parameters[name]["shape"]
 
             if "." in name and name.split(".")[0] != self.modelName:
-                print(f"Skipping parameter '{name}' as it is imported from another model.")
+                # print(f"Skipping parameter '{name}' as it is imported from another model.")
                 continue
 
             if "tokens" in self.parameters[name]:
@@ -466,21 +497,23 @@ class Universal(Model):
             if jnp.any(jnp.isnan(value)) or jnp.any(jnp.isinf(value)):
                 raise ValueError(f"Constant parameter '{name}' contains NaN or infinite values. Please check the parameter initialization.")
             
-        for parameterization in self.parameterizations:
-            print(f"Parameterization '{parameterization}' defined with unconstraint names: {self.parameterizations[parameterization]['unconstraintParameterNames']}.")
+        # for parameterization in self.parameterizations:
+        #     print(f"Parameterization '{parameterization}' defined with unconstraint names: {self.parameterizations[parameterization]['unconstraintParameterNames']}.")
 
         # Get global properties
         self.leftPadding = max([assignment["leftPadding"] for assignment in self.assignments])
         self.rightPadding = max([assignment["rightPadding"] for assignment in self.assignments])
-        print("leftPadding:", self.leftPadding, "rightPadding:", self.rightPadding)
-        print("dataColumns:", self.dataColumns)
-        print("constants:", self.parameterConstants)
-        print("Starting parameters:")
-        for name, value in self.parameterValues.items():
-            print(f"  {name}: {value.shape} = {value}")
-        print("Constants:")
-        for name, value in self.parameterConstants.items():
-            print(f"  {name}: {value.shape} = {value}")
+        # print("leftPadding:", self.leftPadding, "rightPadding:", self.rightPadding)
+        # print("dataColumns:", self.dataColumns)
+        # print("constants:", self.parameterConstants)
+        # print("Starting parameters:")
+        # for name, value in self.parameterValues.items():
+        #     print(f"  {name}: {value.shape} = {value}")
+        # print("Constants:")
+        # for name, value in self.parameterConstants.items():
+        #     print(f"  {name}: {value.shape} = {value}")
+
+        print()
 
         super().constructModel()
 
@@ -602,6 +635,9 @@ class Universal(Model):
 
     @partial(jax.jit, static_argnames=["self", "returnLossPerSample"])
     def lossStep(self, params, data, randomKey = jax.random.PRNGKey(0), returnLossPerSample = False):
+        if len(self.optimize) == 0:
+            raise ValueError("No optimization functions defined. Please ensure the model has at least one optimization function.")
+
         states = self.predictStep(params, randomKey, data = data, universalStateInitializer = 0.0)
 
         # jax.debug.print("===================================")
@@ -661,3 +697,44 @@ class Universal(Model):
         else:
             totalLoss = jax.numpy.mean(totalLossPerSample)
             return totalLoss
+    
+    @partial(jax.jit, static_argnames=["self"])
+    def OLS_getXY(self, data):
+        dataLength = data.shape[0]
+        X = {}
+        Y = {}
+        for dependingVariable in self.OLS:            
+            x = []
+            for term in self.OLS[dependingVariable]["terms"]:
+                def helper(t0):
+                    valueGetter = GetValueFromData(constants = self.parameterConstants, data = data, dataColumns = self.dataColumns, t0 = t0)
+                    value = valueGetter.transform(self.OLS[dependingVariable]["terms"][term])
+                    return jnp.reshape(value, (-1,))
+                batchedHelper = jax.vmap(helper, in_axes=(0,))
+                x.append(batchedHelper(jnp.arange(dataLength)))
+            
+            if self.OLS[dependingVariable]["bias"] is not None:
+                if self.OLS[dependingVariable]["biasIsPositive"]:
+                    bias = jnp.ones((dataLength, 1), dtype=jnp.float32)
+                else:
+                    bias = -jnp.ones((dataLength, 1), dtype=jnp.float32)
+                x.append(bias)
+
+            X[dependingVariable] = jnp.reshape(jnp.stack(x, axis=1), (-1, len(x)))
+
+            yIndex = self.dataColumns.index(dependingVariable)
+            Y[dependingVariable] = data[:, yIndex]
+
+            for constant in self.OLS[dependingVariable]["constants"]:
+                def helper(t0):
+                    valueGetter = GetValueFromData(constants = self.parameterConstants, data = data, dataColumns = self.dataColumns, t0 = t0)
+                    value = valueGetter.transform(constant)
+                    return value
+                batchedHelper = jax.vmap(helper, in_axes=(0,))
+                constantValues = batchedHelper(jnp.arange(dataLength))
+                Y[dependingVariable] -= constantValues
+
+            X[dependingVariable] = X[dependingVariable][100:]
+            Y[dependingVariable] = Y[dependingVariable][100:]
+
+        return X, Y

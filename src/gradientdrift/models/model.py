@@ -73,135 +73,184 @@ class Model:
             if parameterUpdateFrequency == -1:
                 parameterUpdateFrequency = numberOfBatches
 
-            if not optimizerUsesState:
-                @jax.jit
-                def calcGrad(params, batch):
-                    loss, grads = jax.value_and_grad(self.lossStep)(params, batch)
-                    return loss, grads
+            ### =============
+
+            if len(self.OLS) > 0:
+                print("Running OLS optimization...")
+
+                XXSum = {}
+                XYSum = {}
+                for i in range(numberOfBatches):
+                    batch = dataset.getBatch(i)
+                    X, Y = self.OLS_getXY(batch.data)
+                    for dependingVariable in self.OLS:
+                        if dependingVariable not in XXSum:
+                            XXSum[dependingVariable] = jnp.transpose(X[dependingVariable]) @ X[dependingVariable]
+                            XYSum[dependingVariable] = jnp.transpose(X[dependingVariable]) @ Y[dependingVariable]
+                        else:
+                            XXSum[dependingVariable] += jnp.transpose(X[dependingVariable]) @ X[dependingVariable]
+                            XYSum[dependingVariable] += jnp.transpose(X[dependingVariable]) @ Y[dependingVariable]
+
+                B = {}
+                for dependingVariable in self.OLS:
+                    B[dependingVariable] = jax.numpy.linalg.solve(XXSum[dependingVariable], XYSum[dependingVariable])
+                    for i, term in enumerate(self.OLS[dependingVariable]["terms"]):
+                        self.parameterValues[term] = jnp.reshape(B[dependingVariable][i], self.parameterValues[term].shape)
+
+                    if self.OLS[dependingVariable]["bias"] is not None:
+                        bias = jnp.reshape(B[dependingVariable][-1], (1,))
+                        self.parameterValues[self.OLS[dependingVariable]["bias"]] = bias
+
+                RSS = {}
+                for i in range(numberOfBatches):
+                    batch = dataset.getBatch(i)
+                    X, Y = self.OLS_getXY(batch.data)
+                    for dependingVariable in self.OLS:
+                        error = Y[dependingVariable] - X[dependingVariable] @ B[dependingVariable]
+                        if dependingVariable not in RSS:
+                            RSS[dependingVariable] = jnp.sum(error**2)
+                        else:
+                            RSS[dependingVariable] += jnp.sum(error**2)
                 
-                @jax.jit
-                def applyUpdate(grads, params, optState):
-                    updates, newOptState = optimizerObj.update(grads, optState)
-                    newParams = optax.apply_updates(params, updates)
-                    return newParams, newOptState
-                
+                df = self.getDegreesOfFreedom(dataset)
+                for dependingVariable in self.OLS:
+                    sigma = jnp.sqrt(RSS[dependingVariable] / df)
+                    sigmaName = "model.sigma_" + dependingVariable
+                    sigmaParameterized = jnp.reshape(jnp.log(jnp.exp(sigma) - 1), self.parameterValues[sigmaName].shape)
+                    self.parameterValues[sigmaName] = sigmaParameterized
+
             else:
-                @jax.jit
-                def calcGradWithState(params, batch, optimizerState):
-                    loss, grads = optax.value_and_grad_from_state(self.lossStep)(params, batch, state = optimizerState)
-                    return loss, grads
+                print("Running gradient descent optimization...")
                 
-                @jax.jit
-                def applyUpdateWithLineSearch(grads, params, optState, loss, batches):
-                    def lossOverBatches(params):
-                        batchLosses = jax.vmap(self.lossStep, in_axes=(None, 0))(params, batches)
-                        return jax.numpy.mean(batchLosses)
+                if not optimizerUsesState:
+                    @jax.jit
+                    def calcGrad(params, batch):
+                        loss, grads = jax.value_and_grad(self.lossStep)(params, batch)
+                        return loss, grads
                     
-                    updates, newOptState = optimizerObj.update(
-                        grads, optState, params, value = loss, grad = grads, value_fn = lossOverBatches
-                    )
+                    @jax.jit
+                    def applyUpdate(grads, params, optState):
+                        updates, newOptState = optimizerObj.update(grads, optState)
+                        newParams = optax.apply_updates(params, updates)
+                        return newParams, newOptState
                     
-                    newParams = optax.apply_updates(params, updates)
-                    return newParams, newOptState
-            
-            previousStepLoss = float('inf')
-            
-            # Run the optimization loop 
-            for step in range(maxNumberOfSteps):
-
-                self.fitConfig["Number of steps"] = step + 1
-
-                stepStartParams = jax.tree_util.tree_map(lambda x: x, self.parameterValues)
-
-                stepLoss = 0.0
-                stepGrads = jax.tree_util.tree_map(jax.numpy.zeros_like, self.parameterValues)
-
-                key, subKey = jax.random.split(key)
-                batchOrder = jax.random.permutation(subKey, numberOfBatches)
-                
-                aggregatedLoss = 0.0
-                aggregatedGrads = jax.tree_util.tree_map(jax.numpy.zeros_like, self.parameterValues)
-                aggregatedCount = 0
-                selectedBatches = []
-
-                def applyHelper():
-                    nonlocal aggregatedGrads, aggregatedCount, selectedBatches, aggregatedLoss, optimizerState
-                    if aggregatedCount == 0:
-                        raise ValueError("Aggregated count should not be zero at this point.")
-                    if aggregatedCount > 1:
-                        avgGrads = jax.tree_util.tree_map(lambda g: g / aggregatedCount, aggregatedGrads)
-                    else:
-                        avgGrads = aggregatedGrads
-
-                    avgBatchLoss = aggregatedLoss / aggregatedCount
-
-                    if not optimizerUsesState:
-                        self.parameterValues, optimizerState = applyUpdate(avgGrads, self.parameterValues, optimizerState)
-                    else:
-                        batches = [dataset.getBatch(i).data for i in selectedBatches]
-                        stackedBatches = jax.tree_util.tree_map(lambda *args: jnp.stack(args, axis=0), *batches)
-                        self.parameterValues, optimizerState = applyUpdateWithLineSearch(
-                            avgGrads, self.parameterValues, optimizerState, avgBatchLoss, stackedBatches)                        
+                else:
+                    @jax.jit
+                    def calcGradWithState(params, batch, optimizerState):
+                        loss, grads = optax.value_and_grad_from_state(self.lossStep)(params, batch, state = optimizerState)
+                        return loss, grads
+                    
+                    @jax.jit
+                    def applyUpdateWithLineSearch(grads, params, optState, loss, batches):
+                        def lossOverBatches(params):
+                            batchLosses = jax.vmap(self.lossStep, in_axes=(None, 0))(params, batches)
+                            return jax.numpy.mean(batchLosses)
                         
+                        updates, newOptState = optimizerObj.update(
+                            grads, optState, params, value = loss, grad = grads, value_fn = lossOverBatches
+                        )
+                        
+                        newParams = optax.apply_updates(params, updates)
+                        return newParams, newOptState
+                
+                previousStepLoss = float('inf')
+                
+                # Run the optimization loop 
+                for step in range(maxNumberOfSteps):
+
+                    self.fitConfig["Number of steps"] = step + 1
+
+                    stepStartParams = jax.tree_util.tree_map(lambda x: x, self.parameterValues)
+
+                    stepLoss = 0.0
+                    stepGrads = jax.tree_util.tree_map(jax.numpy.zeros_like, self.parameterValues)
+
+                    key, subKey = jax.random.split(key)
+                    batchOrder = jax.random.permutation(subKey, numberOfBatches)
+                    
                     aggregatedLoss = 0.0
                     aggregatedGrads = jax.tree_util.tree_map(jax.numpy.zeros_like, self.parameterValues)
                     aggregatedCount = 0
                     selectedBatches = []
 
-                for i in range(numberOfBatches):
-                    selectedBatches.append(batchOrder[i])
-                    batch = dataset.getBatch(batchOrder[i])
+                    def applyHelper():
+                        nonlocal aggregatedGrads, aggregatedCount, selectedBatches, aggregatedLoss, optimizerState
+                        if aggregatedCount == 0:
+                            raise ValueError("Aggregated count should not be zero at this point.")
+                        if aggregatedCount > 1:
+                            avgGrads = jax.tree_util.tree_map(lambda g: g / aggregatedCount, aggregatedGrads)
+                        else:
+                            avgGrads = aggregatedGrads
 
-                    # jaxpr = jax.make_jaxpr(self.lossStep)(self.parameterValues, batch.data)
-                    # print(jaxpr)
-                    # exit()
+                        avgBatchLoss = aggregatedLoss / aggregatedCount
 
-                    if not optimizerUsesState:
-                        loss, grads = calcGrad(self.parameterValues, batch.data)
-                    else:
-                        loss, grads = calcGradWithState(self.parameterValues, batch.data, optimizerState)
+                        if not optimizerUsesState:
+                            self.parameterValues, optimizerState = applyUpdate(avgGrads, self.parameterValues, optimizerState)
+                        else:
+                            batches = [dataset.getBatch(i).data for i in selectedBatches]
+                            stackedBatches = jax.tree_util.tree_map(lambda *args: jnp.stack(args, axis=0), *batches)
+                            self.parameterValues, optimizerState = applyUpdateWithLineSearch(
+                                avgGrads, self.parameterValues, optimizerState, avgBatchLoss, stackedBatches)                        
+                            
+                        aggregatedLoss = 0.0
+                        aggregatedGrads = jax.tree_util.tree_map(jax.numpy.zeros_like, self.parameterValues)
+                        aggregatedCount = 0
+                        selectedBatches = []
 
-                    lossContainsNaN = jnp.any(jnp.isnan(loss))
-                    gradContainsNaN = any(jnp.any(jnp.isnan(g)) for g in jax.tree_util.tree_leaves(grads))
-                    if lossContainsNaN or gradContainsNaN:
-                        print(f"\n\nError: Loss or gradients contain NaN at step {step + 1}, batch {i + 1}.")
-                        print(f"Gradients: {grads}")
-                        exit(1)
+                    for i in range(numberOfBatches):
+                        selectedBatches.append(batchOrder[i])
+                        batch = dataset.getBatch(batchOrder[i])
 
-                    stepLoss += loss * batch.getEffectiveNObs()
-                    stepGrads = jax.tree_util.tree_map(jax.numpy.add, stepGrads, grads)
+                        # jaxpr = jax.make_jaxpr(self.lossStep)(self.parameterValues, batch.data)
+                        # print(jaxpr)
+                        # exit()
 
-                    aggregatedLoss += loss
-                    aggregatedGrads = jax.tree_util.tree_map(jax.numpy.add, aggregatedGrads, grads)
-                    aggregatedCount += 1
-                    
-                    if aggregatedCount == parameterUpdateFrequency:
+                        if not optimizerUsesState:
+                            loss, grads = calcGrad(self.parameterValues, batch.data)
+                        else:
+                            loss, grads = calcGradWithState(self.parameterValues, batch.data, optimizerState)
+
+                        lossContainsNaN = jnp.any(jnp.isnan(loss))
+                        gradContainsNaN = any(jnp.any(jnp.isnan(g)) for g in jax.tree_util.tree_leaves(grads))
+                        if lossContainsNaN or gradContainsNaN:
+                            print(f"\n\nError: Loss or gradients contain NaN at step {step + 1}, batch {i + 1}.")
+                            print(f"Gradients: {grads}")
+                            exit(1)
+
+                        stepLoss += loss * batch.getEffectiveNObs()
+                        stepGrads = jax.tree_util.tree_map(jax.numpy.add, stepGrads, grads)
+
+                        aggregatedLoss += loss
+                        aggregatedGrads = jax.tree_util.tree_map(jax.numpy.add, aggregatedGrads, grads)
+                        aggregatedCount += 1
+                        
+                        if aggregatedCount == parameterUpdateFrequency:
+                            applyHelper()
+
+                    if aggregatedCount > 0:
                         applyHelper()
 
-                if aggregatedCount > 0:
-                    applyHelper()
+                    sampleLoss = stepLoss / numberOfSamples  
+                    print(f"Step {step+1:4d}, Loss: {sampleLoss:.6f}")
 
-                sampleLoss = stepLoss / numberOfSamples  
-                print(f"Step {step+1:4d}, Loss: {sampleLoss:.6f}")
+                    lossImprovement = abs(previousStepLoss - sampleLoss)
+                    previousStepLoss = sampleLoss
+                    if lossImprovement < 1e-9:
+                        print("Convergence reached based on loss threshold.")
+                        break
 
-                lossImprovement = abs(previousStepLoss - sampleLoss)
-                previousStepLoss = sampleLoss
-                if lossImprovement < 1e-9:
-                    print("Convergence reached based on loss threshold.")
-                    break
+                    stepGrads = jax.tree_util.tree_map(lambda g: g / numberOfBatches, stepGrads)
+                    grad_norm = jax.numpy.linalg.norm(jax.tree_util.tree_flatten(stepGrads)[0][0])
 
-                stepGrads = jax.tree_util.tree_map(lambda g: g / numberOfBatches, stepGrads)
-                grad_norm = jax.numpy.linalg.norm(jax.tree_util.tree_flatten(stepGrads)[0][0])
+                    if grad_norm < 1e-7:
+                        print("Convergence reached based on gradient norm.")
+                        break
 
-                if grad_norm < 1e-7:
-                    print("Convergence reached based on gradient norm.")
-                    break
-
-                pamamsChange = jax.tree_util.tree_map(lambda new, old: new - old, self.parameterValues, stepStartParams)
-                pamamsChangeNorm = jax.numpy.linalg.norm(jax.tree_util.tree_flatten(pamamsChange)[0][0])
-                if pamamsChangeNorm < 1e-7:
-                    print("Convergence reached based on parameter change norm.")
-                    break
+                    pamamsChange = jax.tree_util.tree_map(lambda new, old: new - old, self.parameterValues, stepStartParams)
+                    pamamsChangeNorm = jax.numpy.linalg.norm(jax.tree_util.tree_flatten(pamamsChange)[0][0])
+                    if pamamsChangeNorm < 1e-7:
+                        print("Convergence reached based on parameter change norm.")
+                        break
 
         except KeyboardInterrupt:
             print("Optimization interrupted by user. Press Ctrl+C again to exit.")
@@ -401,6 +450,7 @@ class Model:
         return nObs - nParams
     
     def getStdErrs(self, dataset):
+        print("Calculating standard errors...")
         try:
             # Calculate the Hessian and OPG matrix
             hessian, OPGMatrix = self.calculateHessianAndOPGMatrix(self.parameterValues, dataset)

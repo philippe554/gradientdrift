@@ -2,7 +2,6 @@ import numpy as np
 import re
 import copy
 import operator as op
-import inspect
 from lark import Transformer, v_args, Tree, Token
 from lark.visitors import Interpreter
 import jax.numpy as jnp
@@ -161,6 +160,122 @@ class LabelOuterSum(Interpreter):
     def sum(self, meta, children):
         meta.outerSum = True
 
+class LabelDataDependencies(Transformer):
+    def __init__(self, modelNamespace = "model"):
+        super().__init__()
+        self.modelNamespace = modelNamespace
+    @v_args(meta = True)
+    def variable(self, meta, children):
+        variableName = children[0].value
+        if "." not in variableName:
+            raise ValueError(f"Variable '{variableName}' is not fully qualified. Please ensure it includes the namespace.")
+        if variableName.startswith("data."):
+            tree = Tree(Token("RULE", "variable"), children, meta)
+            tree.meta.dataDependency = "constant"
+            return tree
+        else:
+            # TODO: Check if a state can be constant
+            tree = Tree(Token("RULE", "variable"), children, meta)
+            tree.meta.dataDependency = "state"
+            return tree
+    @v_args(meta = True)
+    def number(self, meta, children): 
+        tree = Tree(Token("RULE", "number"), children, meta)
+        tree.meta.dataDependency = "constant"
+        return tree
+    @v_args(meta = True)
+    def parameter(self, meta, children):
+        parameterName = children[0].value
+        if "." not in parameterName:
+            raise ValueError(f"Parameter '{parameterName}' is not fully qualified. Please ensure it includes the namespace.")
+        parameterNamespace = parameterName.split(".")[0]
+        if parameterNamespace == self.modelNamespace:
+            tree = Tree(Token("RULE", "parameter"), children, meta)
+            tree.meta.dataDependency = "parameter"
+            return tree
+        else:
+            tree = Tree(Token("RULE", "parameter"), children, meta)
+            tree.meta.dataDependency = "constant"
+            return tree
+    @v_args(inline = True, meta = True)
+    def funccall(self, meta, name, args=None):
+        if args is None:
+            args = []
+        else:
+            args = args.children
+        dataDependencyPerArgs = [arg.meta.dataDependency for arg in args]
+        uniqueDataDependencies = set(dataDependencyPerArgs)
+        if len(uniqueDataDependencies) == 1:
+            dataDependency = uniqueDataDependencies.pop()
+            if dataDependency == "constant":
+                tree = Tree(Token("RULE", "funccall"), [Token('FUNCNAME', name), Tree(Token("RULE", "arguments"), args)], meta)
+                tree.meta.dataDependency = "constant"
+                return tree
+            else:
+                tree = Tree(Token("RULE", "funccall"), [Token('FUNCNAME', name), Tree(Token("RULE", "arguments"), args)], meta)
+                tree.meta.dataDependency = "nonlinear"
+                return tree
+        else:
+            tree = Tree(Token("RULE", "funccall"), [Token('FUNCNAME', name), Tree(Token("RULE", "arguments"), args)], meta)
+            tree.meta.dataDependency = "nonlinear"
+            return tree
+
+    @v_args(meta = True)
+    def product(self, meta, children):
+        values = children[::2]
+        numberOfParameters = sum(1 for child in values if child.meta.dataDependency == 'parameter')
+        numberOfConstants = sum(1 for child in values if child.meta.dataDependency == 'constant')
+
+        operators = children[1::2]
+        uniqueOperators = set(op.children[0].value for op in operators)
+        if uniqueOperators != {'*'}:
+            tree = Tree(Token("RULE", "product"), children, meta)
+            tree.meta.dataDependency = "nonlinear"
+            return tree
+        
+        if numberOfConstants == len(values):
+            tree = Tree(Token("RULE", "product"), children, meta)
+            tree.meta.dataDependency = "constant"
+            return tree
+        elif numberOfParameters == 1 and numberOfConstants == len(values) - 1:
+            tree = Tree(Token("RULE", "product"), children, meta)
+            tree.meta.dataDependency = "linearTerm"
+            return tree
+        else:
+            tree = Tree(Token("RULE", "product"), children, meta)
+            tree.meta.dataDependency = "nonlinear"
+            return tree
+        
+    @v_args(meta = True)
+    def sum(self, meta, children):
+        values = children[::2]  # Get every second child starting from the first
+        numberOfParameters = sum(1 for child in values if child.meta.dataDependency == 'parameter')
+        numberOfConstants = sum(1 for child in values if child.meta.dataDependency == 'constant')
+        numberOfLinearTerms = sum(1 for child in values if child.meta.dataDependency == 'linearTerm')
+        numberOfLinearSums = sum(1 for child in values if child.meta.dataDependency == 'linearSum')
+        numberOfLinearSumsAndConstants = sum(1 for child in values if child.meta.dataDependency == 'linearSumAndConstant')
+
+        if numberOfConstants == len(values):
+            tree = Tree(Token("RULE", "sum"), children, meta)
+            tree.meta.dataDependency = "constant"
+            return tree
+        elif numberOfLinearTerms + numberOfLinearSums == len(values) - numberOfConstants:
+            tree = Tree(Token("RULE", "sum"), children, meta)
+            tree.meta.dataDependency = "linearSum"
+            return tree
+        elif numberOfParameters == 1 and numberOfLinearTerms + numberOfLinearSums == len(values) - 1 - numberOfConstants:
+            tree = Tree(Token("RULE", "sum"), children, meta)
+            tree.meta.dataDependency = "linearSumAndConstant"
+            return tree
+        elif numberOfLinearSumsAndConstants == 1 and numberOfLinearTerms + numberOfLinearSums == len(values) - 1 - numberOfConstants:
+            tree = Tree(Token("RULE", "sum"), children, meta)
+            tree.meta.dataDependency = "linearSumAndConstant"
+            return tree
+        else:
+            tree = Tree(Token("RULE", "sum"), children, meta)
+            tree.meta.dataDependency = "nonlinear"
+            return tree
+
 class NameUnnamedParameters(Transformer):
     def __init__(self, existingParameters):
         super().__init__()
@@ -182,15 +297,15 @@ class NameUnnamedParameters(Transformer):
             
             if len(otherChildren) == 0 or len(otherChildren) != len(children) - 2:
                 raise ValueError("Unexpected structure in children. Please ensure the formula is correctly structured.")
-            otherTree = Tree(data, otherChildren, copy.deepcopy(meta))
+            otherTree = Tree(data, otherChildren)
             parameterName = getParameterName(otherTree)
             
             if parameterName in self.existingParameters:
                 raise ValueError(f"Parameter name '{parameterName}' already exists. Please ensure all parameters have unique names.")
             self.existingParameters.add(parameterName)
 
-            children[unnamedIndices[0]] = Tree(Token("RULE", "parameter"), [Token('NAME', parameterName)], copy.deepcopy(meta))
-            return Tree(data, children, copy.deepcopy(meta))
+            children[unnamedIndices[0]] = Tree(Token("RULE", "parameter"), [Token('NAME', parameterName)])
+            return Tree(data, children)
 
 class InsertParameters(Transformer):
     """
@@ -481,7 +596,7 @@ class GetValueFromData(Transformer):
     def parameter(self, children):
         if children:
             parameterName = children[0].value
-            if parameterName in self.params:
+            if self.params is not None and parameterName in self.params:
                 if self.parameterizations is None:
                     raise ValueError("Parameterizations are not defined. Please ensure parameterizations are set for the model.")
                 if parameterName in self.parameterizations:
@@ -590,4 +705,94 @@ class GetValueFromData(Transformer):
         else:
             raise ValueError(f"Function '{name}' is not supported in this context.")
         
-    
+class GetOLSTerms(Interpreter):
+    def __init__(self):
+        self.terms = {}
+        self.bias = None
+        self.biasIsPositive = True
+        self.constants = []
+        super().__init__()
+
+    def __default__(self, tree):
+        raise ValueError(f"Unexpected tree structure: {tree}")
+
+    @v_args(meta = True)
+    def parameter(self, meta, children):
+        cumulativeSignIsPositive = True
+        if hasattr(meta, 'cumulativeSignIsPositive'):
+            cumulativeSignIsPositive = meta.cumulativeSignIsPositive
+
+        parameterName = children[0].value
+        if self.bias is not None:
+            raise ValueError(f"Multiple biases.")
+        else:
+            self.bias = parameterName
+            self.biasIsPositive = cumulativeSignIsPositive
+
+    @v_args(meta = True)
+    def product(self, meta, children):
+        cumulativeSignIsPositive = True
+        if hasattr(meta, 'cumulativeSignIsPositive'):
+            cumulativeSignIsPositive = meta.cumulativeSignIsPositive
+
+        if meta.dataDependency == 'linearTerm':
+            operators = [o.children[0].value for o in children[1::2]]
+            if set(operators) != {"*"}:
+                raise ValueError(f"Expected all operators to be '*', but found: {operators}")
+            parameter = [c for c in children[::2] if c.data == 'parameter']
+            variables = [c for c in children[::2] if c.data != 'parameter']
+            if len(parameter) != 1:
+                raise ValueError(f"Expected exactly one parameter in term, but found: {len(parameter)}")
+            if len(variables) == 0:
+                raise ValueError(f"Expected at least one variable in term, but found: {len(variables)}")
+            
+            parameterName = parameter[0].children[0].value
+            if len(variables) == 1:
+                if cumulativeSignIsPositive:
+                    self.terms[parameterName] = variables[0]
+                else:
+                    self.terms[parameterName] = Tree(Token("RULE", "product"), [
+                        Tree(Token("RULE", "number"), [Token("SIGNED_NUMBER", "-1")]),
+                        Tree(Token("RULE", "operator"), [Token("PRODUCTOPERATOR", "*")]),
+                        variables[0]
+                    ])
+            else:
+                variablesJoined = [variables[0]]
+                for c in variables[1:]:
+                    variablesJoined.append(Tree("operator", [Token("PRODUCTOPERATOR", "*")]))
+                    variablesJoined.append(c)
+                if not cumulativeSignIsPositive:
+                    variablesJoined.append(Tree("operator", [Token("PRODUCTOPERATOR", "*")]))
+                    variablesJoined.append(Tree(Token("RULE", "number"), [Token("SIGNED_NUMBER", "-1")]))
+
+                self.terms[parameterName] = Tree(Token("RULE", "product"), variablesJoined, meta)
+        else:
+            raise ValueError(f"Product: Expected linear term, but found: {meta.dataDependency}")
+
+    @v_args(meta = True)
+    def sum(self, meta, children):
+        outerSignIsPositive = True
+        if hasattr(meta, 'cumulativeSignIsPositive'):
+            outerSignIsPositive = meta.cumulativeSignIsPositive
+
+        if meta.dataDependency == 'linearSum' or meta.dataDependency == 'linearSumAndConstant':
+            for i in range(0, len(children), 2):
+                elementSignIsPositive = True if i == 0 else children[i - 1].children[0].value == '+'
+                cumulativeSignIsPositive = outerSignIsPositive == elementSignIsPositive 
+
+                if children[i].meta.dataDependency == "constant":
+                    if cumulativeSignIsPositive:
+                        self.constants.append(children[i])
+                    else:
+                        self.constants.append(
+                            Tree(Token("RULE", "product"), [
+                                Tree(Token("RULE", "number"), [Token("SIGNED_NUMBER", "-1")]),
+                                Tree(Token("RULE", "operator"), [Token("PRODUCTOPERATOR", "*")]),
+                                children[i]
+                            ])
+                        )
+                else:
+                    children[i].meta.cumulativeSignIsPositive = cumulativeSignIsPositive
+                    self.visit(children[i])
+        else:
+            raise ValueError(f"Sum: Expected linear term, but found: {meta.dataDependency}")

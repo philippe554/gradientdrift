@@ -37,24 +37,16 @@ class Composite:
             assignments.extend(model["obj"].getAssignments(model["name"]))
 
     def fit(self, dataset, *args, **kwargs):
-        key = jax.random.PRNGKey(42)
-        self.constructModel(dataset.getDataColumns(), key)
         constants = {}
+        assignments = []
         for model in self.models:
             model.get("obj").setParameters(constants, "const")
-            model["obj"].fit(dataset, *args, **kwargs)
-            constants.update(model["obj"].getParameters(model["name"]))
+            model["obj"].addAssignment(assignments)
 
-    def predict(self, dataset = None, steps = None, key = jax.random.PRNGKey(42)):
-        key1, key2 = jax.random.split(key)
-        if dataset is not None:
-            self.constructModel(dataset.getDataColumns(), key1)
-            states = self.predictStep(self.parameterValues, randomKey = key2, data = dataset.data)
-        else:
-            self.constructModel([], key1)
-            states = self.predictStep(self.parameterValues, randomKey = key2, steps = steps)
-        states = {k.replace("model.", ""): v for k, v in states.items()}
-        return states
+            model["obj"].fit(dataset, *args, **kwargs)
+            
+            constants.update(model["obj"].getParameters(model["name"]))
+            assignments.extend(model["obj"].getAssignments(model["name"]))
 
     def __getattr__(self, name):
         def dispatcher(*args, **kwargs):
