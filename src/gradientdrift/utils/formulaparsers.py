@@ -49,10 +49,16 @@ formulaGrammar = r"""
 
     funccall: FUNCNAME "(" NEWLINE* [arguments NEWLINE*] ")"
     arguments: sum ("," NEWLINE* sum)*
-    parameter: "{" NEWLINE* NAME ("." NAME)? NEWLINE* "}"
-    variable: NAME ("." NAME)?
+    
+    parameter: "{" NEWLINE* VALUENAME indexlist? NEWLINE* "}"
+    variable: VALUENAME indexlist?
 
-    FUNCNAME: /[a-zA-Z0-9.]+/
+    indexlist: "[" NEWLINE* index ("," NEWLINE* index)* NEWLINE* "]"
+    index: NUMBER | VALUENAME | slice
+    slice: ( (NUMBER)? ":" (NUMBER)? (":" NUMBER)? )
+    
+    VALUENAME: /[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)?/
+    FUNCNAME: /[a-zA-Z_][a-zA-Z0-9_]*/
 
     %import common.CNAME -> NAME
     %import common.NUMBER

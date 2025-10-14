@@ -7,15 +7,16 @@ import datetime
 import re
 import jax.numpy as jnp
 from functools import partial
+import numbers
 
 class Model:
     def predict(self, dataset = None, steps = None, key = jax.random.PRNGKey(42)):
         key1, key2 = jax.random.split(key)
         if dataset is not None:
-            self.constructModel(dataset.getDataColumns(), key1)
+            self.constructModel(dataset.getDataShape(), key1)
             states = self.predictStep(self.parameterValues, randomKey = key2, data = dataset.data)
         else:
-            self.constructModel([], key1)
+            self.constructModel({}, key1)
             states = self.predictStep(self.parameterValues, randomKey = key2, steps = steps)
         states = {k.replace("model.", ""): v for k, v in states.items()}
         return states
@@ -23,14 +24,16 @@ class Model:
     def loss(self, dataset, returnLossPerSample = False):
         if dataset is None:
             raise ValueError("Dataset must be provided to compute loss.")
-        self.constructModel(dataset.getDataColumns())
+        self.constructModel(dataset.getDataShape())
         return self.lossStep(self.parameterValues, dataset.data, returnLossPerSample)
 
-    def fit(self, dataset, seed = 42, batchSize = -1, maxNumberOfSteps = 1000, parameterUpdateFrequency = -1, optimizer = "ADAM"):
+    def fit(self, dataset, seed = 42, batchSize = -1, maxNumberOfSteps = 1000, parameterUpdateFrequency = -1, optimizer = "ADAM", burnInTime = 0):
+        self.burnInTime = burnInTime
+        
         try:
             key = jax.random.PRNGKey(seed)
 
-            self.constructModel(dataset.getDataColumns(), key)
+            self.constructModel(dataset.getDataShape(), key)
             
             if optimizer.lower() == "closedform":
                 raise ValueError("Closed-form optimization is not implemented.")
@@ -94,8 +97,13 @@ class Model:
                 B = {}
                 for dependingVariable in self.OLS:
                     B[dependingVariable] = jax.numpy.linalg.solve(XXSum[dependingVariable], XYSum[dependingVariable])
-                    for i, term in enumerate(self.OLS[dependingVariable]["terms"]):
-                        self.parameterValues[term] = jnp.reshape(B[dependingVariable][i], self.parameterValues[term].shape)
+                    
+                    index = 0
+                    for term in self.OLS[dependingVariable]["terms"]:
+                        shape = self.parameterValues[term].shape
+                        size = np.prod(shape)
+                        self.parameterValues[term] = jnp.reshape(B[dependingVariable][index:index + size], self.parameterValues[term].shape)
+                        index += size
 
                     if self.OLS[dependingVariable]["bias"] is not None:
                         bias = jnp.reshape(B[dependingVariable][-1], (1,))
@@ -296,36 +304,24 @@ class Model:
         return hessian, OPGSum      
     
     def getVariablePrettyName(self, variableName, indexList):
-        if not hasattr(self, "paramDims") or variableName not in self.paramDims:
-            return variableName + "[" + ".".join(map(str, indexList)) + "]"
-        else:
-            template = self.paramDims.get(variableName).copy()
-
-            for i in range(len(indexList)):
-                def replacer(match):
-                    offsetStr = match.group(1)
-                    
-                    offset = 0
-                    if offsetStr:
-                        offset = int(offsetStr)
-
-                    try:
-                        baseValue = int(indexList[i])
-                        return str(baseValue + offset)
-                    except (ValueError, TypeError):
-                        if offset != 0:
-                            return match.group(0)
-                        else:
-                            return str(indexList[i])
-
-                pattern = r'\[i([+-]\d+)?\]'
-                
-                if i < len(template):
-                    template[i] = re.sub(pattern, replacer, template[i])
-
-
-            return variableName + "[" + ".".join(template) + "]"
-
+        if variableName not in self.parameters:
+            raise ValueError(f"Variable '{variableName}' not found in model parameters.")
+        
+        if variableName.startswith("model."):
+            variableNameShort = variableName[6:]
+        
+        indexList = list(indexList)
+        if "dimensionLabels" in self.parameters[variableName]:
+            for i, values in self.parameters[variableName]["dimensionLabels"].items():
+                indexList[i] = values[indexList[i]]
+        
+        if "shape" in self.parameters[variableName]:
+            shape = self.parameters[variableName]["shape"]
+            if shape == (1,):
+                return variableNameShort
+ 
+        return variableNameShort + "[" + ".".join(map(str, indexList)) + "]"
+        
     def summary(self, dataset, trueParams = None, confidenceLevel = 0.95):
         self.allInConfidenceInterval = True
 
@@ -376,21 +372,27 @@ class Model:
                         trueValue = None
 
                     if trueValue is not None:
-                        inConfidenceInterval = lowerBounds[paramName][index] <= trueValue and trueValue <= upperBounds[paramName][index]
+                        if type(trueValue) == np.ndarray:
+                            trueValueIndexed = trueValue[index]
+                        elif type(trueValue) == list and len(index) == 1:
+                            trueValueIndexed = trueValue[index[0]]
+                        elif isinstance(trueValue, numbers.Number):
+                            trueValueIndexed = trueValue
+                        else:
+                            raise ValueError(f"Unsupported type for true parameter value: {type(trueValue)}")
+                        
+                        inConfidenceInterval = lowerBounds[paramName][index] <= trueValueIndexed and trueValueIndexed <= upperBounds[paramName][index]
+                        
                         if not inConfidenceInterval:
                             self.allInConfidenceInterval = False
                         try:
-                            if np.shape(trueValue) == ():
-                                trueValue = f"{trueValue:9.3f}"
-                            else:
-                                trueValue = f"{trueValue[index]:9.3f}"
-
+                            trueValue = f"{trueValueIndexed:9.3f}"
                             if inConfidenceInterval:
                                 trueValue += "*"
                             else:
                                 trueValue += " "
                         except (IndexError, TypeError):
-                            trueValue = "N/A "
+                            trueValue = "ERR "
                     else:
                         trueValue = "N/A "
                 else:

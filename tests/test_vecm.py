@@ -66,7 +66,7 @@ def test_vecm():
 
     data = gd.data.Dataset(X, ["y1", "y2"])
     model = gd.models.Composite(formula)
-    model.fit(data, optimizer = "lbfgs", maxNumberOfSteps = 100)
+    model.fit(data, optimizer = "lbfgs", maxNumberOfSteps = 100, burnInTime = 100)
     model.summary(data, all = True, trueParams = trueParameters)
 
     allInConfidenceInterval = model.isAllInConfidenceInterval()

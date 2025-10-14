@@ -6,36 +6,56 @@ import numpy as np
 from .batch import Batch
 
 class Dataset:
-    def __init__(self, data, columns=None):
-        if columns is None:
-            raise ValueError("Columns must be provided for the dataset.")
-        
+    def __init__(self, data, columns = None):
+        self.shape = {}
+        loaded = False
+
         try:
             import pandas
             if isinstance(data, pandas.DataFrame):
-                data = data.values
-                if columns is None:
+                if columns is not None:
                     raise ValueError("Columns should not be provided for a pandas DataFrame.")
-                columns = data.columns
+                df = data
+                
+                for col in df.columns:
+                    colType = df[col].dtype
+                    if not np.issubdtype(colType, np.number):
+                        column = df[col].astype("category")
+                        df[col] = column.cat.codes
+                        self.shape[col] = column.cat.categories.tolist()
+                    else:
+                        self.shape[col] = (1,)
+
+                data = df.values
+                loaded = True
+
         except ImportError:
             pass
 
+        if not loaded:
+            if columns is None:
+                raise ValueError("Columns must be provided for the dataset.")
+            
+            for col in columns:
+                self.shape[col] = (1,)
+
         if isinstance(data, np.ndarray):
             data = jax.numpy.array(data)
-
-        data = data.reshape(-1, len(columns))
+        data = data.reshape(-1, len(self.shape))         
 
         if not isinstance(data, jax.numpy.ndarray):
-            raise TypeError("Data must be a numpy array or a pandas DataFrame.")
+            raise TypeError(f"Data must be a numpy array or a pandas DataFrame, found {type(data)}")
 
         self.data = data
-        self.columns = columns               
         self.leftPadding = 0
         self.rightPadding = 0
         self.batches = []
 
+    def getDataShape(self):
+        return self.shape
+
     def getDataColumns(self):
-        return self.columns
+        return self.shape.keys()
 
     def setData(self, data):
         self.data = data

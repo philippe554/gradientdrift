@@ -18,13 +18,12 @@ class Universal(Model):
         self.importedConstants = {}
         self.importedParameters = {}
 
-    def constructModel(self, dataColumns, key, modelName = "model"):
+    def constructModel(self, dataShape, key, modelName = "model"):
         if modelName == "model":
             print("Constructing model:")
         else:
             print(f"Constructing model '{modelName}':")
 
-        self.dataColumns = dataColumns
         self.modelName = modelName
 
         # Tokenize the formula
@@ -35,7 +34,6 @@ class Universal(Model):
         else:
             raise ValueError(f"Unsupported formula type: {type(self.formula)}. Expected str or Tree.")
         formulaTree = RemoveNewlines().transform(formulaTree)
-        formulaTree = FlattenNamespaces().transform(formulaTree)
         
         statements = formulaTree.children
         parameterDefinition = [{"tokens" : s} for s in statements if s.data == 'parameterdefinition']
@@ -92,7 +90,7 @@ class Universal(Model):
                     valueGetter = GetValueFromData()
                     if right.data == "parameterlist":
                         value = valueGetter.transform(left)
-                        parameters = GetParameters().transform(right)
+                        parameters = GetParameterNames().transform(right)
                         for parameter in parameters:
                             self.parameterizations[parameter] = {
                                 "unconstraintParameterNames": [parameter],
@@ -117,7 +115,7 @@ class Universal(Model):
 
             initialization["index"] = int(initialization["tokens"].children[1].value)
             rhs = initialization["tokens"].children[2]
-            rhs = AddNamespace(dataColumns = [], modelNamespace = self.modelName).transform(rhs)
+            rhs = AddNamespace(dataColumns = {}, modelNamespace = self.modelName).transform(rhs)
             initialization["value"] = rhs
 
             # print(f"Initialization '{initialization['name']}' at index {initialization['index']} set to {ModelFormulaReconstructor.reconstruct(copy.deepcopy(initialization['value']))}.")
@@ -135,19 +133,19 @@ class Universal(Model):
             for var in dependingVariables:
                 if "." in var:
                     raise ValueError(f"LHS of a formula must not contain namespaces.")
-
+                
             # Name unnamed parameters
-            parameters = GetParameters().transform(rhs)
+            parameters = GetParameterNames().transform(rhs)
             rhs = NameUnnamedParameters(parameters).transform(rhs)
 
             # If no parameters found, auto insert them in the top level sum
             if not rhsIsProbabilistic:               
-                parameters = GetParameters().transform(rhs)
+                parameters = GetParameterNames().transform(rhs)
 
                 if len(parameters) == 0: # No parameters found, automatic mode
                     LabelOuterSum().visit(rhs)
                     rhs = InsertParameters().transform(rhs)
-                    parameters = GetParameters().transform(rhs)
+                    parameters = GetParameterNames().transform(rhs)
                     if len(parameters) == 0:
                         raise ValueError("No parameters found in the formula. Please ensure the formula is correctly specified.")
                     if len(set(parameters)) != len(parameters):
@@ -167,7 +165,7 @@ class Universal(Model):
                     ### Copy from bellow
 
                     if lhs.data != "variable": # like a diff(y) ~ normal(...)
-                        lhsParameters = GetParameters().transform(lhs)
+                        lhsParameters = GetParameterNames().transform(lhs)
                         if len(lhsParameters) != 0:
                             raise ValueError(f"Left-hand side of the assignment must not contain parameters. Found: {', '.join(lhsParameters)}.")
                         lhsVariables = GetVariables().transform(lhs)
@@ -180,8 +178,8 @@ class Universal(Model):
                             # lhs will be on the rhs, so remove the namespace and add it again based on data columns available
                             #constantTerm = copy.deepcopy(lhs)
                             #constantTerm.children[0].value = constantTerm.children[0].value.replace("model.", "") # TODO
-                            constantTerm = Tree(Token('RULE', 'variable'), [Token('NAME', lhsInterated.children[0].value)])
-                            constantTerm = AddNamespace(dataColumns = self.dataColumns, modelNamespace = self.modelName).transform(constantTerm)
+                            constantTerm = Tree(Token('RULE', 'variable'), [Token('VALUENAME', lhsInterated.children[0].value)])
+                            constantTerm = AddNamespace(dataColumns = dataShape.keys(), modelNamespace = self.modelName).transform(constantTerm)
 
                             rhsAssignment = Tree(Token("RULE", "sum"), [
                                 Tree(Token("RULE", "funccall"), [
@@ -213,11 +211,10 @@ class Universal(Model):
                     # tokens = getParser("optimize").parse(
                     #     "maximize: norm.logpdf(" + lhsReconstructed + ", " + meanReconstructed + ", " + stdReconstructed + ")"
                     # )
-                    # tokens = FlattenNamespaces().transform(tokens)
 
                     # Untested code: TODO
 
-                    lhsData = AddNamespace(dataColumns = self.dataColumns, modelNamespace = self.modelName).transform(lhs)
+                    lhsData = AddNamespace(dataColumns = dataShape.keys(), modelNamespace = self.modelName).transform(lhs)
                     args = rhs.children[1].children
                     rhsMean = args[0]
                     rhsStd = args[1]
@@ -242,7 +239,7 @@ class Universal(Model):
                 ### Copy from bellow
 
                 if lhs.data != "variable":
-                    lhsParameters = GetParameters().transform(lhs)
+                    lhsParameters = GetParameterNames().transform(lhs)
                     if len(lhsParameters) != 0:
                         raise ValueError(f"Left-hand side of the assignment must not contain parameters. Found: {', '.join(lhsParameters)}.")
                     lhsVariables = GetVariables().transform(lhs)
@@ -255,8 +252,8 @@ class Universal(Model):
                         # lhs will be on the rhs, so remove the namespace and add it again based on data columns available
                         #constantTerm = copy.deepcopy(lhs)
                         #constantTerm.children[0].value = constantTerm.children[0].value.replace("model.", "") # TODO
-                        constantTerm = Tree(Token('RULE', 'variable'), [Token('NAME', lhs.children[0].value)])
-                        constantTerm = AddNamespace(dataColumns = self.dataColumns, modelNamespace = self.modelName).transform(constantTerm)
+                        constantTerm = Tree(Token('RULE', 'variable'), [Token('VALUENAME', lhs.children[0].value)])
+                        constantTerm = AddNamespace(dataColumns = dataShape.keys(), modelNamespace = self.modelName).transform(constantTerm)
 
                         rhs = Tree(Token("RULE", "sum"), [
                             Tree(Token("RULE", "funccall"), [
@@ -280,8 +277,8 @@ class Universal(Model):
                 dependingVariable = dependingVariables[0]
 
                 lhsModel = AddNamespace(dataColumns = [], modelNamespace = self.modelName).transform(lhs)
-                lhsData = AddNamespace(dataColumns = self.dataColumns, modelNamespace = self.modelName).transform(lhs)
-                rhs = AddNamespace(dataColumns = self.dataColumns, modelNamespace = self.modelName).transform(rhs)
+                lhsData = AddNamespace(dataColumns = dataShape.keys(), modelNamespace = self.modelName).transform(lhs)
+                rhs = AddNamespace(dataColumns = dataShape.keys(), modelNamespace = self.modelName).transform(rhs)
                 
                 rhs = ExpandFunctions().transform(rhs)
                 SetLeafNodeLags().visit(rhs)
@@ -293,7 +290,7 @@ class Universal(Model):
 
                 if rhs.meta.dataDependency in ["linearTerm", "linearSum", "linearSumAndConstant"]:
                     # TODO: move this to a separate function
-                    OLSTermsGetter = GetOLSTerms()
+                    OLSTermsGetter = GetOLSTerms(dataShape)
                     OLSTermsGetter.visit(rhs)
                     self.OLS[dependingVariable] = {
                         "terms": OLSTermsGetter.terms,
@@ -317,7 +314,7 @@ class Universal(Model):
                             lhsModel,
                             lhsData,
                             Tree(Token("RULE", "parameter"), [
-                                Token("NAME", "model.sigma_" + dependingVariable)
+                                Token("VALUENAME", "model.sigma_" + dependingVariable)
                             ])
                         ])
                     ])
@@ -339,14 +336,14 @@ class Universal(Model):
             del assignment["tokens"]
 
             lhs = AddNamespace(dataColumns = [], modelNamespace = self.modelName).transform(lhs)
-            rhs = AddNamespace(dataColumns = self.dataColumns, modelNamespace = self.modelName).transform(rhs)
+            rhs = AddNamespace(dataColumns = dataShape.keys(), modelNamespace = self.modelName).transform(rhs)
 
             rhs = ExpandFunctions().transform(rhs)
 
             if lhs.data == "variable":
                 assignment["name"] = lhs.children[0].value
             else:
-                lhsParameters = GetParameters().transform(lhs)
+                lhsParameters = GetParameterNames().transform(lhs)
                 if len(lhsParameters) != 0:
                     raise ValueError(f"Left-hand side of the assignment must not contain parameters. Found: {', '.join(lhsParameters)}.")
                 lhsVariables = GetVariables().transform(lhs)
@@ -360,7 +357,7 @@ class Universal(Model):
             #         # lhs will be on the rhs, so remove the namespace and add it again based on data columns available
             #         constantTerm = copy.deepcopy(lhs)
             #         constantTerm.children[0].value = constantTerm.children[0].value.replace("model.", "")
-            #         constantTerm = AddNamespace(dataColumns = self.dataColumns, modelNamespace = self.modelName).transform(constantTerm)
+            #         constantTerm = AddNamespace(dataColumns = dataShape.keys(), modelNamespace = self.modelName).transform(constantTerm)
 
             #         rhs = Tree("sum", [
             #             Tree("funccall", [
@@ -385,11 +382,12 @@ class Universal(Model):
             assignment["rightPadding"] = 0
 
             # Get parameters names
-            parameters = GetParameters().transform(rhs)
-            parameterShapesGetter = GetParameterShapes(1)
+            parameterShapesGetter = GetParameterShapesAndDimensionLabels(dataShape, 1)
             outputShape = parameterShapesGetter.transform(rhs)
             if len(outputShape) == 1 and outputShape[0] == 1:
                 shapes = parameterShapesGetter.parameterShapes
+                dimensionLabels = parameterShapesGetter.parameterDimensionLabels
+
                 for name, shape in shapes.items():
                     if name not in self.parameters:
                         self.parameters[name] = {"shape": shape}
@@ -398,6 +396,11 @@ class Universal(Model):
                             self.parameters[name]["shape"] = shape
                         elif self.parameters[name]["shape"] != shape:
                             raise ValueError(f"Parameter '{name}' has inconsistent shapes: {self.parameters[name]['shape']} vs {shape}.")
+                        
+                    if name in dimensionLabels:
+                        self.parameters[name]["dimensionLabels"] = dimensionLabels[name]
+                    else:
+                        self.parameters[name]["dimensionLabels"] = {}
             else:
                 raise ValueError(f"Output shape {outputShape[0]} is not compatible with the model.")
             
@@ -417,15 +420,15 @@ class Universal(Model):
             
             sum = ExpandFunctions().transform(optimize["tokens"].children[1])
             del optimize["tokens"]
-            sum = FlattenNamespaces().transform(sum)
-            sum = AddNamespace(dataColumns = self.dataColumns, modelNamespace = self.modelName).transform(sum)
+            sum = AddNamespace(dataColumns = dataShape.keys(), modelNamespace = self.modelName).transform(sum)
 
             SetLeafNodeLags().visit(sum)
             
             # Get parameters names
-            parameterShapesGetter = GetParameterShapes(1)
+            parameterShapesGetter = GetParameterShapesAndDimensionLabels(dataShape, 1)
             outputShape = parameterShapesGetter.transform(sum)
             shapes = parameterShapesGetter.parameterShapes
+            dimensionLabels = parameterShapesGetter.parameterDimensionLabels
             for name, shape in shapes.items():
                 if name not in self.parameters:
                     self.parameters[name] = {"shape": shape}
@@ -435,6 +438,10 @@ class Universal(Model):
                     elif self.parameters[name]["shape"] != shape:
                         raise ValueError(f"Parameter '{name}' has inconsistent shapes: {self.parameters[name]['shape']} vs {shape}.")
                     
+                if name in dimensionLabels:
+                    self.parameters[name]["dimensionLabels"] = dimensionLabels[name]
+                else:
+                    self.parameters[name]["dimensionLabels"] = {}
             
             # Finalize the formula tokens
             reconstructed = ModelFormulaReconstructor.reconstruct(copy.deepcopy(sum))
@@ -503,6 +510,7 @@ class Universal(Model):
         # Get global properties
         self.leftPadding = max([assignment["leftPadding"] for assignment in self.assignments])
         self.rightPadding = max([assignment["rightPadding"] for assignment in self.assignments])
+        self.dataShape = dataShape
         # print("leftPadding:", self.leftPadding, "rightPadding:", self.rightPadding)
         # print("dataColumns:", self.dataColumns)
         # print("constants:", self.parameterConstants)
@@ -522,8 +530,8 @@ class Universal(Model):
         for assignment in self.assignments:
             exportedAssignments.append({
                 "name": assignment["name"].replace("model.", modelName + "."),
-                "lhs": AddNamespace(dataColumns = self.dataColumns, modelNamespace = modelName).transform(assignment["lhs"]),
-                "rhs": AddNamespace(dataColumns = self.dataColumns, modelNamespace = modelName).transform(assignment["rhs"]),
+                "lhs": AddNamespace(dataColumns = list(self.dataShape.keys()), modelNamespace = modelName).transform(assignment["lhs"]),
+                "rhs": AddNamespace(dataColumns = list(self.dataShape.keys()), modelNamespace = modelName).transform(assignment["rhs"]),
                 "leftPadding": assignment["leftPadding"],
                 "rightPadding": assignment["rightPadding"],
                 "maxDataLag": assignment["maxDataLag"]
@@ -596,7 +604,7 @@ class Universal(Model):
                     for assignment in assignments:
                         valueGetter = GetValueFromData(
                             params = params, constants = self.parameterConstants, 
-                            data = data, dataColumns = self.dataColumns, t0 = t0, states = states,
+                            data = data, dataShape = self.dataShape, t0 = t0, states = states,
                             parameterizations = self.parameterizations, randomKey = randomKey)
                         rhs = valueGetter.transform(assignment["rhs"])
                         randomKey = valueGetter.randomKey
@@ -621,7 +629,7 @@ class Universal(Model):
 
                 for assignment in self.assignments:
                     valueGetter = GetValueFromData(
-                        params = params, constants = self.parameterConstants, data = data, dataColumns = self.dataColumns, 
+                        params = params, constants = self.parameterConstants, data = data, dataShape = self.dataShape, 
                         t0 = t0, statesT0 = states, parameterizations = self.parameterizations)
                     value = valueGetter.transform(assignment["rhs"])
                     states[assignment["name"]] = value
@@ -651,11 +659,11 @@ class Universal(Model):
         for optimize in self.optimize:
             def helper(statesT0, t0):
                 valueGetter = GetValueFromData(
-                    params = params, constants = self.parameterConstants, data = data, dataColumns = self.dataColumns, 
+                    params = params, constants = self.parameterConstants, data = data, dataShape = self.dataShape, 
                     t0 = t0, statesT0 = statesT0, parameterizations = self.parameterizations)
                 
                 # valueGetter = GetValueFromData(
-                #     params = params, constants = self.parameterConstants, data = data, dataColumns = self.dataColumns, 
+                #     params = params, constants = self.parameterConstants, data = data, dataShape = self.dataShape, 
                 #     t0 = t0, states = states, parameterizations = self.parameterizations, randomKey = randomKey)
 
                 if optimize["type"] == "minimize":
@@ -686,8 +694,8 @@ class Universal(Model):
         if jnp.shape(totalLossPerSample) != (data.shape[0] - self.leftPadding - self.rightPadding,):
             raise ValueError(f"Total loss per sample has unexpected shape {jnp.shape(totalLossPerSample)}. Expected shape is ({data.shape[0] - self.leftPadding - self.rightPadding},).")
         
-        burnInTime = 100
-        totalLossPerSample = totalLossPerSample[burnInTime:]
+        if self.burnInTime > 0:
+            totalLossPerSample = totalLossPerSample[self.burnInTime:]
 
         # jax.debug.print("Total loss per sample contains NaN: {contains_nan}", contains_nan=jnp.any(jnp.isnan(totalLossPerSample)))
         # jax.debug.print("Total loss per sample = {total_loss_per_sample}", total_loss_per_sample=totalLossPerSample)
@@ -705,13 +713,16 @@ class Universal(Model):
         Y = {}
         for dependingVariable in self.OLS:            
             x = []
+            numIndependentVariables = 0
             for term in self.OLS[dependingVariable]["terms"]:
                 def helper(t0):
-                    valueGetter = GetValueFromData(constants = self.parameterConstants, data = data, dataColumns = self.dataColumns, t0 = t0)
+                    valueGetter = GetValueFromData(constants = self.parameterConstants, data = data, dataShape = self.dataShape, t0 = t0)
                     value = valueGetter.transform(self.OLS[dependingVariable]["terms"][term])
                     return jnp.reshape(value, (-1,))
                 batchedHelper = jax.vmap(helper, in_axes=(0,))
-                x.append(batchedHelper(jnp.arange(dataLength)))
+                termValue = batchedHelper(jnp.arange(dataLength))
+                x.append(termValue)
+                numIndependentVariables += np.prod(self.parameterValues[term].shape)
             
             if self.OLS[dependingVariable]["bias"] is not None:
                 if self.OLS[dependingVariable]["biasIsPositive"]:
@@ -719,22 +730,24 @@ class Universal(Model):
                 else:
                     bias = -jnp.ones((dataLength, 1), dtype=jnp.float32)
                 x.append(bias)
+                numIndependentVariables += 1
 
-            X[dependingVariable] = jnp.reshape(jnp.stack(x, axis=1), (-1, len(x)))
+            X[dependingVariable] = jnp.reshape(jnp.concatenate(x, axis=1), (-1, numIndependentVariables))
 
-            yIndex = self.dataColumns.index(dependingVariable)
+            yIndex = list(self.dataShape.keys()).index(dependingVariable)
             Y[dependingVariable] = data[:, yIndex]
 
             for constant in self.OLS[dependingVariable]["constants"]:
                 def helper(t0):
-                    valueGetter = GetValueFromData(constants = self.parameterConstants, data = data, dataColumns = self.dataColumns, t0 = t0)
+                    valueGetter = GetValueFromData(constants = self.parameterConstants, data = data, dataShape = self.dataShape, t0 = t0)
                     value = valueGetter.transform(constant)
                     return value
                 batchedHelper = jax.vmap(helper, in_axes=(0,))
                 constantValues = batchedHelper(jnp.arange(dataLength))
                 Y[dependingVariable] -= constantValues
 
-            X[dependingVariable] = X[dependingVariable][100:]
-            Y[dependingVariable] = Y[dependingVariable][100:]
+            if self.burnInTime > 0:
+                X[dependingVariable] = X[dependingVariable][self.burnInTime:]
+                Y[dependingVariable] = Y[dependingVariable][self.burnInTime:]
 
         return X, Y

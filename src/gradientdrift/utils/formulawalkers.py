@@ -25,53 +25,53 @@ class RemoveNewlines(Transformer):
         children = [child for child in children if not (isinstance(child, Token) and child.type == 'NEWLINE')]
         return Tree(data, children, meta)
     
-class FlattenNamespaces(Transformer):
-    def __default__(self, data, children, meta):
-        if data == 'variable':
-            if len(children) == 1 and isinstance(children[0], Token) and children[0].type == 'NAME':
-                return Tree(data, [children[0]], meta)
-            elif len(children) == 2 and isinstance(children[0], Token) and children[0].type == 'NAME':
-                return Tree(data, [Token('NAME', f"{children[0].value}.{children[1].value}")], meta)
-            else:
-                raise ValueError(f"Unexpected children for variable: {children}")
-        elif data == 'parameter':
-            if len(children) == 1 and isinstance(children[0], Token) and children[0].type == 'NAME':
-                return Tree(data, [children[0]], meta)
-            elif len(children) == 2 and isinstance(children[0], Token) and children[0].type == 'NAME':
-                return Tree(data, [Token('NAME', f"{children[0].value}.{children[1].value}")], meta)
-            else:
-                raise ValueError(f"Unexpected children for parameter: {children}")
-        else:
-            return Tree(data, children, meta)
-        
 class AddNamespace(Transformer):
     def __init__(self, dataColumns = [], modelNamespace = "model"):
         super().__init__()
         self.dataColumns = dataColumns
         self.modelNamespace = modelNamespace
 
-    def __default__(self, data, children, meta):
-        if data == 'variable':
+    @v_args(meta = True)
+    def index(self, meta, children):
+        data = 'index'
+        if children and children[0].type == 'VALUENAME':
             if "." not in children[0].value:
                 if children[0].value in self.dataColumns:
-                    return Tree(data, [Token('NAME', f"data.{children[0].value}")], meta)
+                    return Tree(data, [Token('VALUENAME', f"data.{children[0].value}")] + children[1:], meta)
                 else:
-                    return Tree(data, [Token('NAME', f"{self.modelNamespace}.{children[0].value}")], meta)
+                    return Tree(data, [Token('VALUENAME', f"{self.modelNamespace}.{children[0].value}")] + children[1:], meta)
             else:
                 if self.modelNamespace != "model" and children[0].value.startswith("model."):
-                    return Tree(data, [Token('NAME', f"{self.modelNamespace}.{children[0].value[6:]}")], meta)
-                else:
-                    return Tree(data, children, meta)
-        elif data == 'parameter':
-            if "." not in children[0].value:
-                return Tree(data, [Token('NAME', f"{self.modelNamespace}.{children[0].value}")], meta)
-            else:
-                if self.modelNamespace != "model" and children[0].value.startswith("model."):
-                    return Tree(data, [Token('NAME', f"{self.modelNamespace}.{children[0].value[6:]}")], meta)
+                    return Tree(data, [Token('VALUENAME', f"{self.modelNamespace}.{children[0].value[6:]}")] + children[1:], meta)
                 else:
                     return Tree(data, children, meta)
         else:
             return Tree(data, children, meta)
+        
+    @v_args(meta = True)
+    def variable(self, meta, children):
+        data = 'variable'
+        if "." not in children[0].value:
+            if children[0].value in self.dataColumns:
+                return Tree(data, [Token('VALUENAME', f"data.{children[0].value}")] + children[1:], meta)
+            else:
+                return Tree(data, [Token('VALUENAME', f"{self.modelNamespace}.{children[0].value}")] + children[1:], meta)
+        else:
+            if self.modelNamespace != "model" and children[0].value.startswith("model."):
+                return Tree(data, [Token('VALUENAME', f"{self.modelNamespace}.{children[0].value[6:]}")] + children[1:], meta)
+            else:
+                return Tree(data, children, meta)
+            
+    @v_args(meta = True)
+    def parameter(self, meta, children):
+        data = 'parameter'
+        if "." not in children[0].value:
+            return Tree(data, [Token('VALUENAME', f"{self.modelNamespace}.{children[0].value}")] + children[1:], meta)
+        else:
+            if self.modelNamespace != "model" and children[0].value.startswith("model."):
+                return Tree(data, [Token('VALUENAME', f"{self.modelNamespace}.{children[0].value[6:]}")] + children[1:], meta)
+            else:
+                return Tree(data, children, meta)
     
 class SetLeafNodeLags(Interpreter):
     """A visitor to set the lag for leaf nodes in a formula."""
@@ -130,7 +130,7 @@ class GetMaxLag(Transformer):
             args = 0
         return max(funcLag, args)
         
-class GetParameters(Transformer):
+class GetParameterNames(Transformer):
     """A transformer to find all unique column names required by a formula."""
     def __default__(self, data, children, meta):
         return [item for sublist in children for item in sublist]
@@ -304,7 +304,7 @@ class NameUnnamedParameters(Transformer):
                 raise ValueError(f"Parameter name '{parameterName}' already exists. Please ensure all parameters have unique names.")
             self.existingParameters.add(parameterName)
 
-            children[unnamedIndices[0]] = Tree(Token("RULE", "parameter"), [Token('NAME', parameterName)])
+            children[unnamedIndices[0]] = Tree(Token("RULE", "parameter"), [Token('VALUENAME', parameterName)])
             return Tree(data, children)
 
 class InsertParameters(Transformer):
@@ -323,7 +323,7 @@ class InsertParameters(Transformer):
 
                     parameter = Tree(
                         Token('RULE', 'parameter'), [
-                            Token('NAME', parameterName)
+                            Token('VALUENAME', parameterName)
                         ]
                     )
 
@@ -377,9 +377,9 @@ class ExpandFunctions(Transformer):
             return Tree(
                 Token("RULE", "sum"),
                 [
-                    Tree(Token("RULE", "variable"), [Token('NAME', variable)]),
+                    Tree(Token("RULE", "variable"), [Token('VALUENAME', variable)]),
                     Tree("operator", [Token('SUMOPERATOR', '-')]),
-                    Tree(Token("RULE", "variable"), [Token('NAME', data)])
+                    Tree(Token("RULE", "variable"), [Token('VALUENAME', data)])
                 ]
             )
         
@@ -409,12 +409,18 @@ class ExpandFunctions(Transformer):
         else:
             return Tree(Token("RULE", "funccall"), [name, args] if args else [name])
 
-class GetParameterShapes(Transformer):
-    def __init__(self, outputLength):
+class GetParameterShapesAndDimensionLabels(Transformer):
+    def __init__(self, dataShape, outputLength):
         super().__init__()
         self.parameterShapes = {}
+        self.parameterDimensionLabels = {}
+        self.dataShape = dataShape
         self.outputLength = outputLength
     def __default__(self, data, children, meta):
+        # do not attempt to infer shape for indexlist or index
+        if data == "indexlist" or data == "index":
+            return Tree(data, children, meta)
+        
         # check if all children are of the same shape
         if children:
             shapes = [child for child in children]
@@ -427,7 +433,41 @@ class GetParameterShapes(Transformer):
             raise ValueError("No children found. Please ensure the formula is correctly structured.")
     def variable(self, items): return (1,)
     def number(self, items): return (1,)
-    def parameter(self, items): return items[0].value
+    def parameter(self, items):
+        if len(items) == 1:
+            return items[0].value
+        elif len(items) == 2:
+            # indexed parameter
+            parameterName = items[0].value
+            indices = items[1].children
+            parameterShape = [] # the total shape of the parameter
+            parameterShapeSelected = [] # the shape that the index selects
+            for i, index in enumerate(indices):
+                indexToken = index.children[0]
+                if indexToken.type == 'NUMBER':
+                    raise NotImplementedError("Numeric indices are not supported for parameter shape inference. Please use named indices.")
+                elif indexToken.type == 'VALUENAME':
+                    columnName = indexToken.value
+                    if columnName.startswith("data."):
+                        columnName = columnName[5:]
+                    else:
+                        raise ValueError(f"Index '{columnName}' does not refer to a data column. Please ensure indices refer to data columns.")
+                    
+                    if columnName not in self.dataShape:
+                        raise ValueError(f"Column '{columnName}' not found in data shape. Please ensure the column exists.")
+                    columnUniqueValues = len(self.dataShape[columnName])
+                    parameterShape.append(columnUniqueValues)
+                    parameterShapeSelected.append(1)
+
+                    self.setParameterDimensionLabels(parameterName, i, self.dataShape[columnName])
+                else:
+                    raise ValueError(f"Unexpected index type: {indexToken.type}. Please ensure indices are either numbers or parameter names.")
+
+            self.setParameterShape(parameterName, tuple(parameterShape))
+            return tuple(parameterShapeSelected)
+        else:
+            raise ValueError("Parameter with unexpected number of children. Please ensure the formula is correctly structured.")
+
     @v_args(inline = True)
     def funccall(self, name, args=None):
         if args is None:
@@ -476,6 +516,15 @@ class GetParameterShapes(Transformer):
                 raise ValueError(f"Parameter '{parameterName}' has inconsistent shapes: {self.parameterShapes[parameterName]} vs {shape}.")
         else:
             self.parameterShapes[parameterName] = shape
+    def setParameterDimensionLabels(self, parameterName, dimension, labels):
+        if parameterName not in self.parameterDimensionLabels:
+            self.parameterDimensionLabels[parameterName] = {}
+        if dimension in self.parameterDimensionLabels[parameterName]:
+            if self.parameterDimensionLabels[parameterName][dimension] != labels:
+                raise ValueError(f"Parameter '{parameterName}' dimension {dimension} has inconsistent labels: {self.parameterDimensionLabels[parameterName][dimension]} vs {labels}.")
+        else:
+            self.parameterDimensionLabels[parameterName][dimension] = labels
+
     def aggregate(self, children):
         if len(children) < 3:
             raise ValueError("Aggregate operation requires at least tree children.")
@@ -486,30 +535,30 @@ class GetParameterShapes(Transformer):
                 rightShape = children[i + 1]
                 if operator == op.add or operator == op.sub or operator == op.mul or operator == op.truediv:
                     if type(leftShape) == tuple and type(rightShape) == tuple:
-                        leftShape = operator(np.zeros(leftShape), np.zeros(rightShape)).shape
+                        leftShape = operator(np.ones(leftShape), np.ones(rightShape)).shape
                     elif type(leftShape) == tuple and type(rightShape) == str:
                         name = rightShape
                         rightShape = leftShape
                         self.setParameterShape(name, rightShape)
-                        leftShape = operator(np.zeros(leftShape), np.zeros(rightShape)).shape
+                        leftShape = operator(np.ones(leftShape), np.ones(rightShape)).shape
                     elif type(leftShape) == str and type(rightShape) == tuple:
                         name = leftShape
                         leftShape = rightShape
                         self.setParameterShape(name, leftShape)
-                        rightShape = operator(np.zeros(leftShape), np.zeros(rightShape)).shape
+                        rightShape = operator(np.ones(leftShape), np.ones(rightShape)).shape
                     elif type(leftShape) == str and type(rightShape) == str:
                         raise ValueError(f"Cannot derive shape for two parameters: {leftShape} and {rightShape}.")
                     else:
                         raise ValueError(f"Cannot derive shape, should not happen: {leftShape} and {rightShape}.")
                 elif operator == op.matmul:
                     if type(leftShape) == tuple and type(rightShape) == tuple:
-                        leftShape = np.matmul(np.zeros(leftShape), np.zeros(rightShape)).shape
+                        leftShape = np.matmul(np.ones(leftShape), np.ones(rightShape)).shape
                     elif type(leftShape) == tuple and type(rightShape) == str:
                         if len(leftShape) == 1:
                             name = rightShape
                             rightShape = [leftShape[-1], self.outputLength]
                             self.setParameterShape(name, rightShape)
-                            leftShape = np.matmul(np.zeros(leftShape), np.zeros(rightShape)).shape
+                            leftShape = np.matmul(np.ones(leftShape), np.ones(rightShape)).shape
                         else:
                             raise ValueError("Not implemented for more than 1D left shape.")
                     elif type(leftShape) == str and type(rightShape) == tuple:
@@ -517,12 +566,12 @@ class GetParameterShapes(Transformer):
                             name = leftShape
                             leftShape = [self.outputLength, rightShape[0]]
                             self.setParameterShape(name, leftShape)
-                            leftShape = np.matmul(np.zeros(leftShape), np.zeros(rightShape)).shape
+                            leftShape = np.matmul(np.ones(leftShape), np.ones(rightShape)).shape
                         elif len(rightShape) == 2:
                             name = leftShape
                             leftShape = [self.outputLength, rightShape[0], rightShape[1]]
                             self.setParameterShape(name, leftShape)
-                            leftShape = np.tensordot(np.zeros(leftShape), np.zeros(rightShape)).shape
+                            leftShape = np.tensordot(np.ones(leftShape), np.ones(rightShape)).shape
                         else:
                             raise ValueError("Not implemented for more than 2D right shape.")
                     elif type(leftShape) == str and type(rightShape) == str:
@@ -546,13 +595,14 @@ class GetValueFromData(Transformer):
     This expects a fully compiled formula with explicit parameters.
     """
     def __init__(self, params = None, constants = None, data = None, 
-                 dataColumns = None, t0 = 0, statesT0 = None, states = None,
+                 dataShape = None, t0 = 0, statesT0 = None, states = None,
                  parameterizations = None, randomKey = None):
         super().__init__()
         self.params = params
         self.constants = constants
         self.data = data
-        self.dataColumns = dataColumns
+        self.dataShape = dataShape
+        self.dataColumns = list(dataShape.keys()) if dataShape else []
         self.statesT0 = statesT0
         self.states = states
         self.t0 = t0
@@ -589,22 +639,53 @@ class GetValueFromData(Transformer):
     
     def number(self, children):
         if children:
-            return float(children[0].value)
+            if type(children[0].value) == float or type(children[0].value) == int:
+                return children[0].value
+            else:
+                return float(children[0].value)
         else:
             raise ValueError("Number expected but not found in the formula.")
         
-    def parameter(self, children):
-        if children:
+    @v_args(meta = True)
+    def parameter(self, meta, children):
+        if len(children) >= 1:
             parameterName = children[0].value
             if self.params is not None and parameterName in self.params:
-                if self.parameterizations is None:
-                    raise ValueError("Parameterizations are not defined. Please ensure parameterizations are set for the model.")
-                if parameterName in self.parameterizations:
-                    unconstrainedParamNames = self.parameterizations[parameterName]["unconstraintParameterNames"]
-                    unconstrainedParams = [self.params[unconstrainedParamName] for unconstrainedParamName in unconstrainedParamNames]
-                    return self.parameterizations[parameterName]["apply"](*unconstrainedParams)
+                if len(children) == 2:
+                    # indexed parameter
+                    if parameterName in self.parameterizations:
+                        raise NotImplementedError("Indexed parameterizations are not supported yet.")
+
+                    selection = []
+                    for index in children[1].children:
+                        if index.children[0].type == 'NUMBER':
+                            selection.append(int(index.children[0].value))
+                        elif index.children[0].type == 'VALUENAME':
+                            variableName = index.children[0].value
+                            if variableName.startswith("data."):
+                                variableName = variableName[5:]
+                            if variableName not in self.dataShape:
+                                raise ValueError(f"Column '{variableName}' not found in data shape. Please ensure the column exists.")
+                            variableIndex = self.dataColumns.index(variableName)
+                            t = self.t0 - meta.lag
+                            category = self.data[t, variableIndex]
+                            category = jnp.astype(category, int)
+                            selection.append(category)
+                        else:
+                            raise ValueError(f"Unexpected index type: {index.children[0].type}. Please ensure indices are either numbers or parameter names.")
+
+                    return self.params[parameterName][tuple(selection)]
+
                 else:
-                    return self.params[parameterName]
+                    # non-indexed parameter
+                    if self.parameterizations is None:
+                        raise ValueError("Parameterizations are not defined. Please ensure parameterizations are set for the model.")
+                    if parameterName in self.parameterizations:
+                        unconstrainedParamNames = self.parameterizations[parameterName]["unconstraintParameterNames"]
+                        unconstrainedParams = [self.params[unconstrainedParamName] for unconstrainedParamName in unconstrainedParamNames]
+                        return self.parameterizations[parameterName]["apply"](*unconstrainedParams)
+                    else:
+                        return self.params[parameterName]
             elif self.constants and parameterName in self.constants:
                 return self.constants[parameterName]
             else:
@@ -706,7 +787,8 @@ class GetValueFromData(Transformer):
             raise ValueError(f"Function '{name}' is not supported in this context.")
         
 class GetOLSTerms(Interpreter):
-    def __init__(self):
+    def __init__(self, dataShape):
+        self.dataShape = dataShape
         self.terms = {}
         self.bias = None
         self.biasIsPositive = True
@@ -722,12 +804,60 @@ class GetOLSTerms(Interpreter):
         if hasattr(meta, 'cumulativeSignIsPositive'):
             cumulativeSignIsPositive = meta.cumulativeSignIsPositive
 
-        parameterName = children[0].value
-        if self.bias is not None:
-            raise ValueError(f"Multiple biases.")
+        if len(children) == 1:
+            # no indexing, so this is a bias term
+            parameterName = children[0].value
+            if self.bias is not None:
+                raise ValueError(f"Multiple biases.")
+            else:
+                self.bias = parameterName
+                self.biasIsPositive = cumulativeSignIsPositive
+        elif len(children) == 2:
+            # indexed parameter, so this is a term
+            parameterName = children[0].value
+            if parameterName in self.terms:
+                raise ValueError(f"Multiple terms for parameter '{parameterName}'. Please ensure each parameter appears only once in the formula.")
+            
+            indices = children[1].children
+            # currently only support one index
+            if len(indices) != 1:
+                raise ValueError("Currently only single index parameters are supported.")
+            
+            indexToken = indices[0].children[0]
+            if indexToken.type != 'VALUENAME':
+                raise ValueError(f"Unexpected index type: {indexToken.type}. Please ensure indices are parameter names.")
+            
+            indexName = indexToken.value
+            if indexName.startswith("data."):
+                indexName = indexName[5:]
+                
+            if indexName not in self.dataShape:
+                raise ValueError(f"Index '{indexName}' not found in data shape. Please ensure the index exists.")
+            
+            if type(self.dataShape[indexName]) is not list:
+                raise ValueError(f"Index '{indexName}' is not categorical. Please ensure the index is categorical.")
+
+            numberOfCategories = len(self.dataShape[indexName])
+
+            oneHotEncoding = Tree("funccall", [
+                Token('FUNCNAME', 'one_hot'),
+                Tree("arguments", [
+                    Tree("variable", [Token('VALUENAME', "data." + indexName)], meta),
+                    Tree("number", [Token('SIGNED_NUMBER', numberOfCategories)], meta)
+                ])
+            ], meta)
+
+            if cumulativeSignIsPositive:
+                self.terms[parameterName] = oneHotEncoding
+            else:
+                self.terms[parameterName] = Tree(Token("RULE", "product"), [
+                    Tree(Token("RULE", "number"), [Token("SIGNED_NUMBER", "-1")]),
+                    Tree(Token("RULE", "operator"), [Token("PRODUCTOPERATOR", "*")]),
+                    oneHotEncoding
+                ])
+
         else:
-            self.bias = parameterName
-            self.biasIsPositive = cumulativeSignIsPositive
+            raise ValueError("Parameter with unexpected number of children. Please ensure the formula is correctly structured.")
 
     @v_args(meta = True)
     def product(self, meta, children):

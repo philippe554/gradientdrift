@@ -1,7 +1,7 @@
 
 from gradientdrift.models import Universal
 from gradientdrift.utils.formulaparsers import getParser
-from gradientdrift.utils.formulawalkers import RemoveNewlines, FlattenNamespaces, AddNamespace
+from gradientdrift.utils.formulawalkers import RemoveNewlines, AddNamespace
 from lark import Tree
 import jax
 
@@ -19,7 +19,6 @@ class Composite:
                 if spec.data == "namedmodel":                   
                     name = spec.children[0].value
                     modelTokens = spec.children[1]
-                    modelTokens = FlattenNamespaces().transform(modelTokens)
                     model = Universal(modelTokens)
                     self.models.append({
                         "name": name,
@@ -28,12 +27,12 @@ class Composite:
 
         self.mainModelIndex = len(self.models) - 1
 
-    def constructModel(self, dataColumns, key):
+    def constructModel(self, dataShape, key):
         assignments = []
         keys = jax.random.split(key, len(self.models))
         for i, model in enumerate(self.models):
             model["obj"].addAssignment(assignments)
-            model["obj"].constructModel(dataColumns, keys[i])
+            model["obj"].constructModel(dataShape, keys[i])
             assignments.extend(model["obj"].getAssignments(model["name"]))
 
     def fit(self, dataset, *args, **kwargs):

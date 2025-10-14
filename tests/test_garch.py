@@ -45,7 +45,7 @@ def test_garch():
 
     data = gd.data.Dataset(Y, ["y"])
     model = gd.models.Universal(formula)
-    model.fit(data, optimizer = "lbfgs", maxNumberOfSteps = 50)
+    model.fit(data, optimizer = "lbfgs", maxNumberOfSteps = 50, burnInTime = 100)
     model.summary(data, trueParams = trueParameters)
 
     allInConfidenceInterval = model.isAllInConfidenceInterval()
