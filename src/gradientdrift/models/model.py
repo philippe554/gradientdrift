@@ -27,7 +27,7 @@ class Model:
         self.constructModel(dataset.getDataShape())
         return self.lossStep(self.parameterValues, dataset.data, returnLossPerSample)
 
-    def fit(self, dataset, seed = 42, batchSize = -1, maxNumberOfSteps = 1000, parameterUpdateFrequency = -1, optimizer = "ADAM", burnInTime = 0):
+    def fit(self, dataset, seed = 42, batchSize = -1, maxNumberOfSteps = 1000, parameterUpdateFrequency = -1, optimizer = "ADAM", burnInTime = 0, learningRate = None):
         self.burnInTime = burnInTime
         
         try:
@@ -49,7 +49,7 @@ class Model:
             }   
 
             if optimizer.lower() == "adam":
-                learningRate = 0.01
+                learningRate = learningRate if learningRate is not None else 0.01
                 optimizerObj = optax.adam(learningRate)
                 optimizerUsesState = False
                 self.fitConfig["Optimizer"] = "ADAM"
@@ -78,7 +78,7 @@ class Model:
 
             ### =============
 
-            if len(self.OLS) > 0:
+            if len(self.OLS) > 0 and len(self.latentParameters) == 0:
                 print("Running OLS optimization...")
 
                 XXSum = {}
@@ -124,7 +124,7 @@ class Model:
                 for dependingVariable in self.OLS:
                     sigma = jnp.sqrt(RSS[dependingVariable] / df)
                     sigmaName = "model.sigma_" + dependingVariable
-                    sigmaParameterized = jnp.reshape(jnp.log(jnp.exp(sigma) - 1), self.parameterValues[sigmaName].shape)
+                    sigmaParameterized = jnp.reshape(self.parameterizations[sigmaName]["inverse"](sigma), self.parameterValues[sigmaName].shape)
                     self.parameterValues[sigmaName] = sigmaParameterized
 
             else:
@@ -307,6 +307,7 @@ class Model:
         if variableName not in self.parameters:
             raise ValueError(f"Variable '{variableName}' not found in model parameters.")
         
+        variableNameShort = variableName
         if variableName.startswith("model."):
             variableNameShort = variableName[6:]
         
@@ -453,6 +454,11 @@ class Model:
     
     def getStdErrs(self, dataset):
         print("Calculating standard errors...")
+
+        if len(self.latentParameters) > 0:
+            print("Warning: Standard errors are not available for models with latent parameters.")
+            return jax.tree_util.tree_map(lambda x: jnp.full_like(x, jnp.nan), self.getConstraintParameters())
+
         try:
             # Calculate the Hessian and OPG matrix
             hessian, OPGMatrix = self.calculateHessianAndOPGMatrix(self.parameterValues, dataset)

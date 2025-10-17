@@ -8,7 +8,7 @@ formulaGrammar = r"""
 
     model: NEWLINE* statement (NEWLINE+ (statement))* NEWLINE*
     
-    ?statement: (parameterdefinition | formula | initialization | assignment | optimize | constraint)
+    ?statement: (prior | parameterdefinition | formula | initialization | assignment | optimize | constraint)
 
     formula: dependingvariables "~" NEWLINE* sum
 
@@ -18,6 +18,8 @@ formulaGrammar = r"""
     parameterdefinition: ("const")? parameterlist ("=" NEWLINE* (sum | shape))+
     parameterlist: parameter ("," NEWLINE* parameter)*
     shape: "[" NEWLINE* (NUMBER NEWLINE* ("," NEWLINE* NUMBER NEWLINE* )*)? "]"
+
+    prior: parameter "~" NEWLINE* sum
 
     constraint: boundconstraint | sumconstraint 
     boundconstraint: (sum "<" parameterlist) | (parameterlist "<" sum) | (sum "<" parameterlist "<" sum)
@@ -45,10 +47,13 @@ formulaGrammar = r"""
          | variable
          | parameter
          | funccall
+         | array
          | "(" NEWLINE* sum NEWLINE* ")"
 
     funccall: FUNCNAME "(" NEWLINE* [arguments NEWLINE*] ")"
     arguments: sum ("," NEWLINE* sum)*
+
+    array: "{" NEWLINE* (sum ("," NEWLINE* sum)*)? NEWLINE* "}"
     
     parameter: "{" NEWLINE* VALUENAME indexlist? NEWLINE* "}"
     variable: VALUENAME indexlist?

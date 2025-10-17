@@ -11,6 +11,159 @@ from gradientdrift.utils.formulawalkers import *
 from gradientdrift.utils.formulaparsers import getParser, ModelFormulaReconstructor
 from gradientdrift.utils.functionmap import isDistributionFunction
 
+def unpackPriors(priors, parameters, parameterizations):
+    latentParameters = {}
+
+    for prior in priors:
+        lhs, rhs = prior["tokens"].children
+        name = lhs.children[0].value
+        if name in latentParameters:
+            raise ValueError(f"Duplicate prior definition found for latent parameter '{name}'. Each latent parameter must have only one prior.")
+        latentParameters[name] = {}
+
+        if rhs.data == "funccall":
+            distributionName = rhs.children[0].value
+            args = rhs.children[1].children if len(rhs.children) > 1 else []
+            if distributionName == "normal":
+                if len(args) != 2:
+                    raise ValueError(f"Normal distribution must have exactly two arguments: mean and standard deviation. Found: {len(args)} arguments.")
+                
+                nameWithoutNamespace = name.split(".")[-1]
+                guideName = "guide." + nameWithoutNamespace
+
+                # tokens to calculate the logpdf of the latent variable with respect to the prior
+                latentParameters[name]["prior"] = Tree(Token("RULE", "funccall"), [
+                    Token("FUNCNAME", "norm.logpdf"),
+                    Tree(Token("RULE", "arguments"), [
+                        Tree(Token("RULE", "parameter"), [Token("VALUENAME", name)]),
+                        args[0],
+                        args[1]
+                    ])
+                ])
+                # tokens to go from the guide to the latent variable
+                latentParameters[name]["sample"] = Tree(Token("RULE", "sum"), [
+                    Tree(Token("RULE", "parameter"), [Token("VALUENAME", guideName + "_loc")]),
+                    Tree("operator", [Token("SUMOPERATOR", "+")]),
+                    Tree(Token("RULE", "product"), [
+                        Tree(Token("RULE", "parameter"), [Token("VALUENAME", guideName + "_scale")]),
+                        Tree("operator", [Token("PRODUCTOPERATOR", "*")]),
+                        Tree(Token("RULE", "funccall"), [
+                            Token("FUNCNAME", "normal"),
+                            Tree(Token("RULE", "arguments"), [
+                                Tree(Token("RULE", "number"), [Token("SIGNED_NUMBER", "0")]),
+                                Tree(Token("RULE", "number"), [Token("SIGNED_NUMBER", "1")])
+                            ])
+                        ])
+                    ])
+                ])
+                # tokens to calculate the logpdf of the latent variable with respect to the guide
+                latentParameters[name]["guide"] = Tree(Token("RULE", "funccall"), [
+                    Token("FUNCNAME", "norm.logpdf"),
+                    Tree(Token("RULE", "arguments"), [
+                        Tree(Token("RULE", "parameter"), [Token("VALUENAME", name)]),
+                        Tree(Token("RULE", "parameter"), [Token("VALUENAME", guideName + "_loc")]),
+                        Tree(Token("RULE", "parameter"), [Token("VALUENAME", guideName + "_scale")])
+                    ])
+                ])
+
+                size = 1
+                if guideName == "guide.re":
+                    size = 18
+
+                if guideName + "_loc" not in parameters:
+                    parameters[guideName + "_loc"] = {}
+                parameters[guideName + "_loc"]["shape"] = (size,)
+                # parameters[guideName + "_loc"]["tokens"] = args[0]
+
+                if guideName + "_scale" not in parameters:
+                    parameters[guideName + "_scale"] = {}
+                parameters[guideName + "_scale"]["shape"] = (size,)
+                # parameters[guideName + "_scale"]["tokens"] = args[1]
+                parameterizations[guideName + "_scale"] = {
+                    "unconstraintParameterNames": [guideName + "_scale"],
+                    "apply": lambda p, v = 0: jnp.exp(p),
+                    "inverse": lambda p, v = 0: jnp.log(p)
+                }
+
+            elif distributionName == "halfnormal":
+                if len(args) != 1:
+                    raise ValueError(f"Halfnormal distribution must have exactly one argument: standard deviation. Found: {len(args)} arguments.")
+                
+                nameWithoutNamespace = name.split(".")[-1]
+                guideName = "guide." + nameWithoutNamespace
+
+                # tokens to calculate the logpdf of the latent variable with respect to the prior
+                latentParameters[name]["prior"] = Tree(Token("RULE", "sum"), [
+                    Tree(Token("RULE", "funccall"), [
+                        Token("FUNCNAME", "norm.logpdf"),
+                        Tree(Token("RULE", "arguments"), [
+                            Tree(Token("RULE", "parameter"), [Token("VALUENAME", name)]),
+                            Tree(Token("RULE", "number"), [Token("SIGNED_NUMBER", "0")]),
+                            args[0]
+                        ])
+                    ]),
+                    Tree("operator", [Token("SUMOPERATOR", "+")]),
+                    Tree(Token("RULE", "funccall"), [
+                        Token("FUNCNAME", "log"),
+                        Tree(Token("RULE", "arguments"), [
+                            Tree(Token("RULE", "number"), [Token("SIGNED_NUMBER", "2")])
+                        ])
+                    ])
+                ])
+                # tokens to go from the guide to the latent variable
+                latentParameters[name]["sample"] = Tree(Token("RULE", "product"), [
+                    Tree(Token("RULE", "parameter"), [Token("VALUENAME", guideName + "_scale")]),
+                    Tree("operator", [Token("PRODUCTOPERATOR", "*")]),
+                    Tree(Token("RULE", "funccall"), [
+                        Token("FUNCNAME", "abs"), 
+                        Tree(Token("RULE", "arguments"), [
+                            Tree(Token("RULE", "funccall"), [
+                                Token("FUNCNAME", "normal"),
+                                Tree(Token("RULE", "arguments"), [
+                                    Tree(Token("RULE", "number"), [Token("SIGNED_NUMBER", "0")]),
+                                    Tree(Token("RULE", "number"), [Token("SIGNED_NUMBER", "1")])
+                                ])
+                            ])
+                        ])
+                    ])
+                ])
+                # tokens to calculate the logpdf of the latent variable with respect to the guide
+                latentParameters[name]["guide"] = Tree(Token("RULE", "sum"), [
+                    Tree(Token("RULE", "funccall"), [
+                        Token("FUNCNAME", "norm.logpdf"),
+                        Tree(Token("RULE", "arguments"), [
+                            Tree(Token("RULE", "parameter"), [Token("VALUENAME", name)]),
+                            Tree(Token("RULE", "number"), [Token("SIGNED_NUMBER", "0")]),
+                            Tree(Token("RULE", "parameter"), [Token("VALUENAME", guideName + "_scale")])
+                        ])
+                    ]),
+                    Tree("operator", [Token("SUMOPERATOR", "+")]),
+                    Tree(Token("RULE", "funccall"), [
+                        Token("FUNCNAME", "log"),
+                        Tree(Token("RULE", "arguments"), [
+                            Tree(Token("RULE", "number"), [Token("SIGNED_NUMBER", "2")])
+                        ])
+                    ])
+                ])
+
+                if guideName + "_scale" not in parameters:
+                    parameters[guideName + "_scale"] = {}
+
+                parameters[guideName + "_scale"]["shape"] = (1,)
+                parameterizations[guideName + "_scale"] = {
+                    "unconstraintParameterNames": [guideName + "_scale"],
+                    "apply": lambda p, v = 0: jnp.exp(p),
+                    "inverse": lambda p, v = 0: jnp.log(p)
+                }
+                # parameters[guideName + "_scale"]["tokens"] = args[0]
+
+            else:
+                raise ValueError(f"Unsupported distribution '{distributionName}' in the prior.")
+        else:
+            raise ValueError(f"Right-hand side of the prior must be a distribution function. Found: {rhs.data}.")
+        
+    return latentParameters
+
 class Universal(Model):
     def __init__(self, formula):
         self.formula = formula
@@ -42,6 +195,7 @@ class Universal(Model):
         self.assignments = [{"tokens" : s} for s in statements if s.data == 'assignment']
         self.formulas = [{"tokens" : s} for s in statements if s.data == 'formula']
         self.optimize = [{"tokens" : s} for s in statements if s.data == 'optimize']
+        self.priors = [{"tokens" : s} for s in statements if s.data == 'prior']
         self.OLS = {}
 
         # Process parameter definitions (should come first)
@@ -52,7 +206,7 @@ class Universal(Model):
             for name in definition["tokens"].children[0].children:
                 name = name.children[0].value
                 if "." in name:
-                    if name.split(".")[0] == modelName:
+                    if name.split(".")[0] == modelName or name.split(".")[0] == "guide":
                         names.append(name)
                     else:
                         raise ValueError(f"Parameter name '{name}' does not match the model name '{modelName}'. Please ensure the parameter names are correctly defined.")
@@ -120,6 +274,8 @@ class Universal(Model):
 
             # print(f"Initialization '{initialization['name']}' at index {initialization['index']} set to {ModelFormulaReconstructor.reconstruct(copy.deepcopy(initialization['value']))}.")
   
+        self.latentParameters = unpackPriors(self.priors, self.parameters, self.parameterizations)
+
         # Process formulas (insert parameters and split into assignments and optimizations)
         for i, formula in enumerate(self.formulas):
             lhs, rhs = formula["tokens"].children
@@ -323,8 +479,8 @@ class Universal(Model):
 
                 self.parameterizations["model.sigma_" + dependingVariable] = {
                     "unconstraintParameterNames": ["model.sigma_" + dependingVariable],
-                    "apply": lambda p, v = 0: jax.nn.softplus(p) + v,
-                    "inverse": lambda p, v = 0: jnp.log(jnp.exp(p - v) - 1)
+                    "apply": lambda p, v = 0: jnp.exp(p),
+                    "inverse": lambda p, v = 0: jnp.log(p)
                 }
 
         for importedAssignment in self.importedAssignments:
@@ -459,12 +615,14 @@ class Universal(Model):
 
             shape = self.parameters[name]["shape"]
 
-            if "." in name and name.split(".")[0] != self.modelName:
-                # print(f"Skipping parameter '{name}' as it is imported from another model.")
+            if "." in name and name.split(".")[0] != self.modelName and name.split(".")[0] != "guide":
+                continue
+
+            if name in self.latentParameters:
                 continue
 
             if "tokens" in self.parameters[name]:
-                valueGetter = GetValueFromData(randomKey = keys[i])
+                valueGetter = GetValueFromData(randomKey = keys[i], params = self.parameterValues)
                 value = valueGetter.transform(self.parameters[name]["tokens"])
 
                 if name in self.parameterizations:
@@ -640,9 +798,19 @@ class Universal(Model):
             states = batchedForward(jnp.arange(dataLength))
 
         return states
-
+    
     @partial(jax.jit, static_argnames=["self", "returnLossPerSample"])
     def lossStep(self, params, data, randomKey = jax.random.PRNGKey(0), returnLossPerSample = False):
+        if len(self.latentParameters) == 0:
+            return self.MLE_loss(params, data, randomKey, returnLossPerSample)
+        else:
+            if returnLossPerSample:
+                raise ValueError("returnLossPerSample=True is not supported for VI_loss.")
+            
+            return self.VI_loss(params, data, randomKey)
+
+    @partial(jax.jit, static_argnames=["self", "returnLossPerSample"])
+    def MLE_loss(self, params, data, randomKey = jax.random.PRNGKey(0), returnLossPerSample = False):
         if len(self.optimize) == 0:
             raise ValueError("No optimization functions defined. Please ensure the model has at least one optimization function.")
 
@@ -751,3 +919,94 @@ class Universal(Model):
                 Y[dependingVariable] = Y[dependingVariable][self.burnInTime:]
 
         return X, Y
+    
+    def VI_sample(self, guideParams, randomKey):
+        latentParams = {}
+
+        for name in self.latentParameters:
+            subKey, randomKey = jax.random.split(randomKey)
+            sampleTokens = self.latentParameters[name]["sample"]
+            valueGetter = GetValueFromData(
+                params = guideParams, 
+                randomKey = subKey, 
+                parameterizations = self.parameterizations
+            )
+            value = valueGetter.transform(sampleTokens)
+
+            if name == "model.re":
+                value = value - jnp.mean(value)
+
+            latentParams[name] = value
+            
+        for name in guideParams:
+            if not name.startswith("guide."):
+                latentParams[name] = guideParams[name] 
+
+        return latentParams
+
+    def VI_priorProbability(self, latentParams):
+        logPriorSum = 0.0
+
+        for name in latentParams:
+            if name in self.latentParameters:
+                priorTokens = self.latentParameters[name]["prior"]
+                valueGetter = GetValueFromData(
+                    params = latentParams,
+                    parameterizations=self.parameterizations
+                )
+                logPrior = valueGetter.transform(priorTokens)
+                logPriorSum += jnp.sum(logPrior)
+
+        return logPriorSum
+
+    def VI_guideProbability(self, guideParams, latentParams):
+        logGuideSum = 0.0
+
+        mergedParams = {}
+        for name in self.latentParameters:
+            mergedParams[name] = latentParams[name]
+        for name in guideParams:
+            if name.startswith("guide."):
+                mergedParams[name] = guideParams[name]
+
+        for name in self.latentParameters:
+            guideTokens = self.latentParameters[name]["guide"]
+            valueGetter = GetValueFromData(
+                params = mergedParams,
+                parameterizations=self.parameterizations
+            )
+            logGuide = valueGetter.transform(guideTokens)
+            logGuideSum += jnp.sum(logGuide)
+
+        return logGuideSum
+
+    @partial(jax.jit, static_argnames=["self"])
+    def VI_loss(self, guideParams, data, randomKey):
+
+        # Maximum A Posteriori (MAP) or Empirical Bayes estimation
+        #  --> This is the mix of MLE and VI, where we optimize both model parameters and guide parameters
+
+        print("guideParams:", list(guideParams.keys()))
+
+        # 1. Sample latent variables from the guide q(z)
+        latentParams = self.VI_sample(guideParams, randomKey)
+
+        print("latentParams:", list(latentParams.keys()))
+
+        # 2. Compute log p(y | z) using the default MLE loss
+        logPY = -self.MLE_loss(latentParams, data)
+
+        # 3. Compute log p(z) 
+        logPZ = self.VI_priorProbability(latentParams)
+
+        # 4. Compute log p(y, z)
+        logPYZ = logPY + logPZ
+
+        # 5. Compute log q(z)
+        logQZ = self.VI_guideProbability(guideParams, latentParams)
+
+        # ELBO = E_q[log p(y, z) - log q(z)]
+        elbo = logPYZ - logQZ
+
+        # We maximize the ELBO (usually minimize negative ELBO)
+        return -jnp.reshape(elbo, ())

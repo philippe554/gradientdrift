@@ -467,6 +467,20 @@ class GetParameterShapesAndDimensionLabels(Transformer):
             return tuple(parameterShapeSelected)
         else:
             raise ValueError("Parameter with unexpected number of children. Please ensure the formula is correctly structured.")
+    def array(self, items):
+        if len(items) == 0:
+            raise ValueError("Array cannot be empty. Please ensure the array has at least one element.")
+        else:
+            shapes = [item for item in items]
+            uniqueShapes = set(shapes)
+            if len(uniqueShapes) == 1:
+                elementShape = uniqueShapes.pop()
+                if elementShape == () or elementShape == (1,):
+                    return (len(items),)
+                else:
+                    return (len(items),) + elementShape
+            else:
+                raise ValueError("Array elements have different shapes. Please ensure all elements are of the same shape.")
 
     @v_args(inline = True)
     def funccall(self, name, args=None):
@@ -646,6 +660,21 @@ class GetValueFromData(Transformer):
         else:
             raise ValueError("Number expected but not found in the formula.")
         
+    def array(self, children):
+        if len(children) == 0:
+            raise ValueError("Array cannot be empty. Please ensure the array has at least one element.")
+        else:
+            shapes = [jnp.shape(item) for item in children]
+            uniqueShapes = set(shapes)
+            if len(uniqueShapes) == 1:
+                elementShape = uniqueShapes.pop()
+                if elementShape == () or elementShape == (1,):
+                    return jnp.concatenate([jnp.reshape(item, (1,)) for item in children], axis=0)
+                else:
+                    return jnp.concatenate([jnp.reshape(item, (1,) + elementShape) for item in children], axis=0)
+            else:
+                raise ValueError("Array elements have different shapes. Please ensure all elements are of the same shape.")
+
     @v_args(meta = True)
     def parameter(self, meta, children):
         if len(children) >= 1:
