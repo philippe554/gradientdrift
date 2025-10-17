@@ -3,7 +3,7 @@ import statsmodels.api as sm
 import statsmodels.formula.api as smf
 import gradientdrift as gd
 
-def test_panel_data_models():
+def test_fixed_effect():
     grunfeld_data = sm.datasets.grunfeld.load_pandas().data
 
     print("Fitting Fixed Effect Model (using OLS with dummies)...")
@@ -50,4 +50,4 @@ def test_panel_data_models():
     # print(re_model.summary())
 
 if __name__ == '__main__':
-    test_panel_data_models()
+    test_fixed_effect()
