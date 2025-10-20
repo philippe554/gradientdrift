@@ -8,6 +8,8 @@ import re
 import jax.numpy as jnp
 from functools import partial
 import numbers
+from gradientdrift.math.ess import *
+from gradientdrift.math.rhat import *
 
 class Model:
     def predict(self, dataset = None, steps = None, key = jax.random.PRNGKey(42)):
@@ -26,6 +28,146 @@ class Model:
             raise ValueError("Dataset must be provided to compute loss.")
         self.constructModel(dataset.getDataShape())
         return self.lossStep(self.parameterValues, dataset.data, returnLossPerSample)
+    
+    def MCMC_getCredibleIntervals(self, allParams, confidenceLevel = 0.95):
+        lowerQuantile = (1.0 - confidenceLevel) / 2.0  # e.g., 0.025
+        upperQuantile = (1.0 + confidenceLevel) / 2.0  # e.g., 0.975
+        quantilesToFind = jnp.array([lowerQuantile, upperQuantile])
+
+        def getLeafInterval(arr):
+            nChains = arr.shape[0]
+            nSamples = arr.shape[1]
+
+            mergedParams = arr.reshape((nChains * nSamples, -1))
+
+            intervals = jnp.quantile(mergedParams, q=quantilesToFind, axis=0)
+
+            originalParamShape = arr.shape[2:]
+
+            return intervals.reshape((2, *originalParamShape))
+        
+        allIntervals = jax.tree_util.tree_map(getLeafInterval, allParams)
+
+        lowerBounds = jax.tree_util.tree_map(lambda x: x[0], allIntervals)
+        upperBounds = jax.tree_util.tree_map(lambda x: x[1], allIntervals)
+
+        return lowerBounds, upperBounds
+
+    def MCMC_fit(self, dataset, seed):
+        self.requestPadding(dataset)
+        dataset.prepareBatches(-1)
+        data = dataset.getBatch(0).data
+
+        burnInChunkSize = 100
+        burnInChunks = 100
+        targetAcceptanceRate = 0.234 # Optimal for high-dimensional models
+        stepSizeAdaptationFactor = 1.2
+
+        chunkSize = 10000
+        numberOfChunks = 100
+        convergenceCheckInterval = 5   
+        numberOfChains = 8
+
+        key = jax.random.PRNGKey(seed)
+        initKey, key = jax.random.split(key)
+
+        initKeys = jax.random.split(initKey, numberOfChains)
+        lastParams = jax.vmap(lambda k: self.getNewParamsFromPrior(k))(initKeys)
+
+        dummyParams = self.getNewParamsFromPrior(jax.random.PRNGKey(0))
+        stepSizePerBlock = []
+        for name in dummyParams.keys():
+            stepSize = jax.tree_util.tree_map(jax.numpy.zeros_like, dummyParams)
+            stepSize[name] = jnp.ones_like(dummyParams[name]) * 0.1
+            stepSizePerBlock.append(stepSize)
+
+        vmapped_MCMC_chunk = jax.vmap(self.MCMC_chunk, in_axes=(0, None, None, 0, None))
+
+        # Burn-in loop
+
+        for step in range(burnInChunks):
+            chunkKey, key = jax.random.split(key)
+            subkeys = jax.random.split(chunkKey, numberOfChains)
+
+            stepSizePerBlockPytree = jax.tree_util.tree_map(
+                lambda *leaves: jnp.stack(leaves), 
+                *stepSizePerBlock
+            )
+            lastParams, chunkParams, acceptCounts = vmapped_MCMC_chunk(lastParams, data, stepSizePerBlockPytree, subkeys, burnInChunkSize)
+
+            acceptCounts = jnp.mean(acceptCounts, axis=0)
+
+            for i, acceptRate in enumerate(acceptCounts / burnInChunkSize):
+                if acceptRate < targetAcceptanceRate:
+                    stepSizePerBlock[i] = jax.tree_util.tree_map(lambda s: s / stepSizeAdaptationFactor, stepSizePerBlock[i])
+                else:
+                    stepSizePerBlock[i] = jax.tree_util.tree_map(lambda s: s * stepSizeAdaptationFactor, stepSizePerBlock[i])
+
+        print(f"Completed burn-in, Acceptance rate: {acceptCounts / burnInChunkSize}")
+
+        # Main MCMC loop
+
+        allParamsPerChain = []
+
+        for step in range(numberOfChunks):
+            chunkKey, key = jax.random.split(key)
+            subkeys = jax.random.split(chunkKey, numberOfChains)
+
+            stepSizePerBlockPytree = jax.tree_util.tree_map(
+                lambda *leaves: jnp.stack(leaves), 
+                *stepSizePerBlock
+            )
+            lastParams, chunkParams, acceptCounts = vmapped_MCMC_chunk(lastParams, data, stepSizePerBlockPytree, subkeys, chunkSize)
+
+            acceptCounts = jnp.mean(acceptCounts, axis=0)
+
+            allParamsPerChain.append(chunkParams)
+            print(f"Completed MCMC chunk {step + 1}, Acceptance rate: {acceptCounts / chunkSize}")
+
+            if (step + 1) % convergenceCheckInterval == 0:
+                allParamsMerged = jax.tree_util.tree_map(
+                    lambda *chunks: jnp.concatenate(chunks, axis=1), 
+                    *allParamsPerChain
+                )
+                
+                rHatValues = getRHat(allParamsMerged)
+                ess = calculate_ess(allParamsMerged)
+
+                maxRHat = max(
+                    jnp.max(rHatArray) 
+                    for rHatArray in jax.tree_util.tree_leaves(rHatValues)
+                )
+
+                minESS = min(
+                    jnp.min(essArray) 
+                    for essArray in jax.tree_util.tree_leaves(ess)
+                )
+
+                print(f"MCMC convergence check at chunk {step + 1}: max R-hat = {maxRHat:.4f}, min ESS = {minESS:.4f}")
+                if maxRHat < 1.01 and minESS > 200:
+                    print("MCMC chains have converged based on R-hat criterion.")
+                    break
+
+        allParamsPerChain = jax.tree_util.tree_map(
+            lambda *chunks: jnp.concatenate(chunks, axis=1), 
+            *allParamsPerChain
+        )
+
+        self.parameterValues = jax.tree_util.tree_map(
+            lambda arr: jnp.mean(arr, axis=(0, 1)), 
+            allParamsPerChain
+        )
+
+        self.MCMC_credibleIntervals = self.MCMC_getCredibleIntervals(allParamsPerChain)
+
+        if numberOfChains > 1:
+            rHatValues = getRHat(allParamsPerChain)
+
+            print("MCMC R-hat values:")
+            for paramName, rHatArray in rHatValues.items():
+                for index, rHat in np.ndenumerate(np.asarray(rHatArray)):
+                    paramPrettyName = self.getVariablePrettyName(paramName, index)
+                    print(f"{paramPrettyName:<30.30} R-hat: {rHat:.4f}")
 
     def fit(self, dataset, seed = 42, batchSize = -1, maxNumberOfSteps = 1000, parameterUpdateFrequency = -1, optimizer = "ADAM", burnInTime = 0, learningRate = None):
         self.burnInTime = burnInTime
@@ -35,9 +177,6 @@ class Model:
 
             self.constructModel(dataset.getDataShape(), key)
             
-            if optimizer.lower() == "closedform":
-                raise ValueError("Closed-form optimization is not implemented.")
-
             fitStartTime = datetime.datetime.now()
 
             self.fitConfig = {
@@ -60,8 +199,15 @@ class Model:
                 optimizerUsesState = True
                 self.fitConfig["Optimizer"] = "L-BFGS"
 
+            elif optimizer.lower() == "mcmc":
+                self.MCMC_fit(dataset, seed)
+                fitEndTime = datetime.datetime.now()
+                self.fitConfig["Fit end time"] = fitEndTime.strftime("%a, %d %b %Y %H:%M:%S")
+                self.fitConfig["Fit duration"] = str(fitEndTime - fitStartTime)
+                return
+
             else:
-                raise ValueError(f"Unknown optimizer: {optimizer}. Supported optimizers are 'adam' and 'lbfgs'.")
+                raise ValueError(f"Unknown optimizer: {optimizer}.")
             
             optimizerState = optimizerObj.init(self.parameterValues)
             
@@ -356,7 +502,13 @@ class Model:
         estimates = self.getConstraintParameters()
         tStats = self.getTStats(dataset, standardErrors = standardErrors)
         pValues = self.getPValues(dataset, standardErrors = standardErrors)
-        lowerBounds, upperBounds = self.getConfIntervals(dataset, standardErrors = standardErrors, confidenceLevel = confidenceLevel)
+        
+        if hasattr(self, "MCMC_credibleIntervals"):
+            lowerBounds, upperBounds = self.MCMC_credibleIntervals
+            lowerBounds = self.applyParameterization(lowerBounds)
+            upperBounds = self.applyParameterization(upperBounds)
+        else:
+            lowerBounds, upperBounds = self.getConfIntervals(dataset, standardErrors = standardErrors, confidenceLevel = confidenceLevel)
 
         for paramName, paramArray in estimates.items():
             for index, estimate in np.ndenumerate(paramArray):

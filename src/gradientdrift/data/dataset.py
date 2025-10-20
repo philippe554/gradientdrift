@@ -6,7 +6,7 @@ import numpy as np
 from .batch import Batch
 
 class Dataset:
-    def __init__(self, data, columns = None):
+    def __init__(self, data, columns = None, categoricalColumns = None):
         self.shape = {}
         loaded = False
 
@@ -19,7 +19,7 @@ class Dataset:
                 
                 for col in df.columns:
                     colType = df[col].dtype
-                    if not np.issubdtype(colType, np.number):
+                    if not np.issubdtype(colType, np.number) or (categoricalColumns is not None and col in categoricalColumns):
                         column = df[col].astype("category")
                         df[col] = column.cat.codes
                         self.shape[col] = column.cat.categories.tolist()

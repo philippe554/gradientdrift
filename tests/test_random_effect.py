@@ -9,22 +9,39 @@ def test_random_effect():
 
     sleepstudy = sm.datasets.get_rdataset("sleepstudy", "lme4").data
 
+    print(sleepstudy.head())
+
     model = smf.mixedlm("Reaction ~ Days", sleepstudy, groups=sleepstudy["Subject"]).fit()
     print(model.summary())
 
     formula = """
+        Reaction ~ {beta_days} * Days + {re[Subject]}
+    """
+
+    data = gd.data.Dataset(sleepstudy, categoricalColumns = ["Subject"])
+    model = gd.models.Universal(formula)
+    model.fit(data)
+    model.summary(data)
+
+    formula = """
+        {model.intercept} = [1]
+        {model.beta_days} = [1]
+        {model.sigma_re} = [1]
+        {model.sigma_Reaction} = [1]
+        {model.re} = [18]
+
         {model.intercept} ~ normal(250, 50)  # Prior centered near baseline
         {model.beta_days} ~ normal(10, 10)    # Prior for the slope
         {model.sigma_re} ~ halfnormal(50)     # Group variance
         {model.sigma_Reaction} ~ halfnormal(50)    # Observation noise
         {model.re[Subject]} ~ normal(0, {model.sigma_re})
 
-        Reaction ~ {model.intercept} + {model.beta_days} * Days + {model.re[Subject]}
+        Reaction ~ normal({model.intercept} + {model.beta_days} * Days + {model.re[Subject]}, {model.sigma_Reaction})
     """
 
-    data = gd.data.Dataset(sleepstudy)
+    data = gd.data.Dataset(sleepstudy, categoricalColumns = ["Subject"])
     model = gd.models.Universal(formula)
-    model.fit(data, maxNumberOfSteps = 1000, learningRate = 0.001)
+    model.fit(data, optimizer = "mcmc")
     model.summary(data)
 
     exit()
@@ -45,16 +62,15 @@ def test_random_effect():
     }
 
     formula = """
-        {guide.intercept_loc} = -50
+        #{guide.intercept_loc} = -50
         {model.intercept} ~ normal(0, 100)
         
         {model.alpha} ~ normal(0, 10)
         {model.beta} ~ normal(0, 10)
         
-        {guide.stddev_scale} = 50
+        #{guide.stddev_scale} = 50
         
-        
-        {guide.sigma_invest_scale} = 50
+        #{guide.sigma_invest_scale} = 50
         {model.sigma_invest} ~ halfnormal(50)
 
         

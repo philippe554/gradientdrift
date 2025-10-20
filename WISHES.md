@@ -139,7 +139,8 @@ sum({W1},{W2}) == 5
 
 Solvers:
 
-MCMC (first RWMH, then NUTS)
+MCMC (first RWMH, later NUTS and SGMCMC)
+    Metropolis-Adjusted Langevin Algorithm (MALA) (include gradient)
 VI
 EM with Kalman smoother for the E step
 EM with VI for the E step "Variational EM (VEM)"

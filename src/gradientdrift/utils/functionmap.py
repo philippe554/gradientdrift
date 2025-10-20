@@ -44,7 +44,7 @@ def getFunctionMap():
         recursiveSearchForFunctions(ns)
 
     # TODO: temporary fix for normal distribution
-    functionMap["normal"] = lambda key, mean=0.0, stddev=1.0: jax.random.normal(key, shape=(), dtype=jax.numpy.float32) * stddev + mean
+    functionMap["normal"] = lambda key, mean=0.0, stddev=1.0, shape=(): jax.random.normal(key, shape=shape, dtype=jax.numpy.float32) * stddev + mean
 
     return functionMap
 

@@ -10,6 +10,7 @@ from gradientdrift.models.model import Model
 from gradientdrift.utils.formulawalkers import *
 from gradientdrift.utils.formulaparsers import getParser, ModelFormulaReconstructor
 from gradientdrift.utils.functionmap import isDistributionFunction
+from gradientdrift.utils.jaxhelpers import *
 
 def unpackPriors(priors, parameters, parameterizations):
     latentParameters = {}
@@ -63,6 +64,19 @@ def unpackPriors(priors, parameters, parameterizations):
                         Tree(Token("RULE", "parameter"), [Token("VALUENAME", name)]),
                         Tree(Token("RULE", "parameter"), [Token("VALUENAME", guideName + "_loc")]),
                         Tree(Token("RULE", "parameter"), [Token("VALUENAME", guideName + "_scale")])
+                    ])
+                ])
+                # tokens to generate a sample from the prior
+                shape = parameters[name]["shape"] if "shape" in parameters[name] else (1,)
+                shape = shape[0] if len(shape) == 1 else 1
+                latentParameters[name]["generate"] = Tree(Token("RULE", "funccall"), [
+                    Token("FUNCNAME", "normal"),
+                    Tree(Token("RULE", "arguments"), [
+                        args[0],
+                        args[1],
+                        Tree(Token("RULE", "array"), [
+                            Tree(Token("RULE", "number"), [Token("SIGNED_NUMBER", shape)])
+                        ])
                     ])
                 ])
 
@@ -145,6 +159,19 @@ def unpackPriors(priors, parameters, parameterizations):
                         ])
                     ])
                 ])
+                # tokens to generate a sample from the prior
+                latentParameters[name]["generate"] = Tree(Token("RULE", "funccall"), [
+                    Token("FUNCNAME", "abs"),
+                    Tree(Token("RULE", "arguments"), [
+                        Tree(Token("RULE", "funccall"), [
+                            Token("FUNCNAME", "normal"),
+                            Tree(Token("RULE", "arguments"), [
+                                Tree(Token("RULE", "number"), [Token("SIGNED_NUMBER", "0")]),
+                                args[0]
+                            ])
+                        ])
+                    ])
+                ])
 
                 if guideName + "_scale" not in parameters:
                     parameters[guideName + "_scale"] = {}
@@ -156,6 +183,13 @@ def unpackPriors(priors, parameters, parameterizations):
                     "inverse": lambda p, v = 0: jnp.log(p)
                 }
                 # parameters[guideName + "_scale"]["tokens"] = args[0]
+
+                parameterizations[name] = {
+                    "unconstraintParameterNames": [name],
+                    "apply": lambda p, v = 0: jnp.exp(p),
+                    "inverse": lambda p, v = 0: jnp.log(p)
+                }
+
 
             else:
                 raise ValueError(f"Unsupported distribution '{distributionName}' in the prior.")
@@ -273,8 +307,6 @@ class Universal(Model):
             initialization["value"] = rhs
 
             # print(f"Initialization '{initialization['name']}' at index {initialization['index']} set to {ModelFormulaReconstructor.reconstruct(copy.deepcopy(initialization['value']))}.")
-  
-        self.latentParameters = unpackPriors(self.priors, self.parameters, self.parameterizations)
 
         # Process formulas (insert parameters and split into assignments and optimizations)
         for i, formula in enumerate(self.formulas):
@@ -605,6 +637,8 @@ class Universal(Model):
 
             optimize["sum"] = sum
 
+        self.latentParameters = unpackPriors(self.priors, self.parameters, self.parameterizations)
+
         # Initialize parameters (should come after all formulas and assignments)
         keys = jax.random.split(key, len(self.parameters))
         self.parameterConstants = {}
@@ -616,6 +650,7 @@ class Universal(Model):
             shape = self.parameters[name]["shape"]
 
             if "." in name and name.split(".")[0] != self.modelName and name.split(".")[0] != "guide":
+                # Skip parameters that are not part of the model or guide
                 continue
 
             if name in self.latentParameters:
@@ -720,6 +755,15 @@ class Universal(Model):
                     self.importedConstants[name] = jnp.asarray(parameters[name])
         else:
             raise ValueError(f"Unsupported parameter type '{type}'. Supported types are 'init' and 'const'.")
+        
+    def getNewParamsFromPrior(self, randomKey):
+        newParams = {}
+        keys = jax.random.split(randomKey, len(self.latentParameters))
+        for i, name in enumerate(self.latentParameters):
+            valueGetter = GetValueFromData(randomKey = keys[i], params = newParams, constants = self.parameterConstants, parameterizations = self.parameterizations)
+            newParams[name] = valueGetter.transform(self.latentParameters[name]["generate"])
+
+        return newParams
 
     def requestPadding(self, dataset):
         dataset.setLeftPadding(self.leftPadding)
@@ -816,12 +860,6 @@ class Universal(Model):
 
         states = self.predictStep(params, randomKey, data = data, universalStateInitializer = 0.0)
 
-        # jax.debug.print("===================================")
-        # jax.debug.print("Parameters: {params}", params=params)
-        # jax.debug.print("model.y contains NaN: {contains_nan}", contains_nan=jnp.any(jnp.isnan(states["model.y"])))
-        # jax.debug.print("model.sigmaSq contains NaN: {contains_nan}", contains_nan=jnp.any(jnp.isnan(states["model.sigmaSq"])))
-        # jax.debug.print("States after prediction: {states}", states=states)
-
         losses = []
 
         for optimize in self.optimize:
@@ -846,9 +884,6 @@ class Universal(Model):
             timesteps = jnp.arange(self.leftPadding, data.shape[0] - self.rightPadding)
             loss = batchedHelper(paddedStates, timesteps)
 
-            # jax.debug.print("Loss contains NaN: {contains_nan}", contains_nan=jnp.any(jnp.isnan(loss)))
-            # jax.debug.print("Loss = {loss}", loss=loss)
-
             lossShape = jnp.shape(loss)
             if len(lossShape) == 1 and lossShape[0] == data.shape[0] - self.leftPadding - self.rightPadding:
                 losses.append(loss)
@@ -864,9 +899,6 @@ class Universal(Model):
         
         if self.burnInTime > 0:
             totalLossPerSample = totalLossPerSample[self.burnInTime:]
-
-        # jax.debug.print("Total loss per sample contains NaN: {contains_nan}", contains_nan=jnp.any(jnp.isnan(totalLossPerSample)))
-        # jax.debug.print("Total loss per sample = {total_loss_per_sample}", total_loss_per_sample=totalLossPerSample)
 
         if returnLossPerSample:
             return totalLossPerSample
@@ -1010,3 +1042,68 @@ class Universal(Model):
 
         # We maximize the ELBO (usually minimize negative ELBO)
         return -jnp.reshape(elbo, ())
+    
+    @partial(jax.jit, static_argnames=["self"])
+    def MCMC_logPosterior(self, params, data):
+        logLikelihood = -(self.MLE_loss(params, data) *  data.shape[0])
+        logPrior = self.VI_priorProbability(params)
+        logPosterior = logLikelihood + logPrior
+        return logPosterior
+    
+    @partial(jax.jit, static_argnames=["self"])
+    def MCMC_step(self, initParams, initLogPosterior, data, stepSizePerBlock, key):
+        numberOfBlocks = jax.tree_util.tree_leaves(stepSizePerBlock)[0].shape[0]
+        componentKeys = jax.random.split(key, numberOfBlocks)
+
+        def componentStep(carry, xsSlice):
+            params, logPosterior = carry
+            componentKey, stepSizeComponent = xsSlice
+
+            keyProposal, keyAccept = jax.random.split(componentKey, 2)
+
+            randomPytree = makeRandomPytree(keyProposal, params)
+            proposedParams = jax.tree_util.tree_map(lambda p, d, s: p + (d * s), params, randomPytree, stepSizeComponent)
+            proposedLogPosterior = self.MCMC_logPosterior(proposedParams, data)
+
+            logAlpha = jnp.minimum(0.0, proposedLogPosterior - logPosterior)
+            logThreshold = jnp.log(jax.random.uniform(keyAccept))
+            accept = logThreshold < logAlpha
+
+            nextParams, nextLogPosterior, acceptCount = jax.lax.cond(accept, 
+                lambda: (proposedParams, proposedLogPosterior, 1), 
+                lambda: (params, logPosterior, 0)
+            )
+
+            carry = (nextParams, nextLogPosterior)
+            return carry, acceptCount
+
+        initialCarry = (initParams, initLogPosterior)
+        xs = (componentKeys, stepSizePerBlock)
+        finalCarry, acceptCounts = lax.scan(componentStep, initialCarry, xs)
+        finalParams, finalLogPosterior = finalCarry
+
+        return finalParams, finalLogPosterior, acceptCounts
+
+    @partial(jax.jit, static_argnames=["self", "chunkSize"])
+    def MCMC_chunk(self, params, data, stepSizePerBlock, randomKey, chunkSize):
+        keys = jax.random.split(randomKey, chunkSize)
+        logPosterior = self.MCMC_logPosterior(params, data)
+
+        def scanStep(carry, key):
+            params, logPosterior, totalAcceptCount = carry
+            nextParams, nextLogPosterior, acceptCount = self.MCMC_step(params, logPosterior, data, stepSizePerBlock, key)
+            totalAcceptCount = totalAcceptCount + acceptCount
+            carry = (nextParams, nextLogPosterior, totalAcceptCount)
+
+            # Only return the last parameters from each step
+            return carry, nextParams
+
+        numberOfBlocks = jax.tree_util.tree_leaves(stepSizePerBlock)[0].shape[0]
+        zeroAcceptCount = jnp.array([0] * numberOfBlocks)
+        initialCarry = (params, logPosterior, zeroAcceptCount)
+        finalCarry, allParams = lax.scan(scanStep, initialCarry, keys)
+        lastParams, lastLogPosterior, totalAcceptCount = finalCarry
+
+        return lastParams, allParams, totalAcceptCount
+
+
