@@ -15,7 +15,7 @@ formulaGrammar = r"""
     initialization: NAME "[" NEWLINE* NUMBER NEWLINE* "]" "=" NEWLINE* sum
     assignment: sum "=" NEWLINE* sum
     
-    parameterdefinition: ("const")? parameterlist ("=" NEWLINE* (sum | shape))+
+    parameterdefinition: ("const")? ("latent")? parameterlist ("=" NEWLINE* (sum | shape))+
     parameterlist: parameter ("," NEWLINE* parameter)*
     shape: "[" NEWLINE* (NUMBER NEWLINE* ("," NEWLINE* NUMBER NEWLINE* )*)? "]"
 
@@ -31,7 +31,7 @@ formulaGrammar = r"""
     COMMENT: /#[^\n]*/
     NEWLINE: ( /\r?\n[\t ]*/ | COMMENT )+
 
-    dependingvariables: sum ("," sum)*
+    dependingvariables: sum ("," sum)* -> array
 
     ?sum: product (sumoperator NEWLINE* product)*
     sumoperator: SUMOPERATOR -> operator

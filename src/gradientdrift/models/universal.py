@@ -11,6 +11,7 @@ from gradientdrift.utils.formulawalkers import *
 from gradientdrift.utils.formulaparsers import getParser, ModelFormulaReconstructor
 from gradientdrift.utils.functionmap import isDistributionFunction
 from gradientdrift.utils.jaxhelpers import *
+from gradientdrift.utils.sympyhelpers import *
 
 def unpackPriors(priors, parameters, parameterizations):
     latentParameters = {}
@@ -198,6 +199,100 @@ def unpackPriors(priors, parameters, parameterizations):
         
     return latentParameters
 
+def insertParameters(formulaTree):
+    # parameters = GetParameterNames().transform(rhs)
+
+    # if len(parameters) == 0: # No parameters found, automatic mode
+    #     LabelOuterSum().visit(rhs)
+    #     rhs = InsertParameters().transform(rhs)
+    #     parameters = GetParameterNames().transform(rhs)
+    #     if len(parameters) == 0:
+    #         raise ValueError("No parameters found in the formula. Please ensure the formula is correctly specified.")
+    #     if len(set(parameters)) != len(parameters):
+    #         raise ValueError("Duplicate parameters found in the formula. Please ensure each parameter is unique.")
+
+    return formulaTree
+
+def convertToProbabilisticFormula(formulaTree):
+    lhs, rhs = formulaTree.children
+
+    if rhs.data == "funccall" and isDistributionFunction(rhs.children[0].value):
+        return formulaTree
+    
+    else:
+        formulaName = getParameterName(lhs)
+        sigmaName = formulaName + "_sigma"
+        sigma = Tree(Token("RULE", "parameter"), [Token("VALUENAME", sigmaName)])
+
+        rhs = insertParameters(rhs)
+
+        tokens = Tree(Token("RULE", "funccall"), [
+            Token("FUNCNAME", "normal"),
+            Tree(Token("RULE", "arguments"), [rhs, sigma])
+        ])
+        return Tree(Token("RULE", "formula"), [lhs, tokens])
+
+def isolateLHS(lhs, rhs, dataColumns, modelName):
+    lhsVariables = GetVariables().transform(lhs)
+    if len(set(lhsVariables)) != 1:
+        raise ValueError(f"Left-hand side of the assignment must contain exactly one variable. Found: {', '.join(lhsVariables)}.")
+    
+    if lhs.data == "array":
+        allChildrenAreVariables = all(child.data == "variable" for child in lhs.children)
+        if allChildrenAreVariables:
+            return copy.deepcopy(lhs), copy.deepcopy(rhs)
+        else:
+            if len(lhs.children) != 1:
+                raise ValueError(f"A non-pure lhs can only have one child. Found: {len(lhs.children)} children.")
+            else:
+                return isolateLHS(lhs.children[0], rhs, dataColumns, modelName)
+
+    elif lhs.data == "variable":
+        return copy.deepcopy(lhs), copy.deepcopy(rhs)        
+
+    elif lhs.data == "funccall" and lhs.children[0].value == "diff":
+        lhsInterated = lhs.children[1].children[0]
+
+        constantTerm = Tree(Token('RULE', 'variable'), [Token('VALUENAME', lhsInterated.children[0].value)])
+        constantTerm = AddNamespace(dataColumns = dataColumns, modelNamespace = modelName).transform(constantTerm)
+
+        rhsAssignment = Tree(Token("RULE", "sum"), [
+            Tree(Token("RULE", "funccall"), [
+                Token("FUNCNAME", "lag"),
+                Tree(Token("RULE", "arguments"), [constantTerm])
+            ]),
+            Tree("operator", [
+                Token("SUMOPERATOR", "+")
+            ]),
+            copy.deepcopy(rhs)
+        ])
+
+        return copy.deepcopy(lhsInterated), copy.deepcopy(rhsAssignment)
+    else:
+        raise ValueError(f"Left-hand side of the assignment can not be processed. Found: {lhs.data}.")
+
+def searchClosedFormSolution(lossFormula):
+    print("Searching for closed-form solution for the loss formula")
+
+    larkToSymPy = LarkToSymPy()
+    expr = larkToSymPy.transform(lossFormula)
+    print("Loss expression:", expr)
+
+    parameters = GetParameterNames().transform(lossFormula)
+    parameters = ['mu', 'alpha', 'beta']  # Temporary hardcoded for testing
+    print("Parameters found:", parameters)
+
+    parameterSymbols = [sp.Symbol(p) for p in parameters]
+    grads = [sp.diff(expr, p) for p in parameterSymbols]
+    for p, g in zip(parameters, grads):
+        print(f"Gradient w.r.t. {p}:", g)
+
+    solution = sp.solve(grads, parameterSymbols)
+    print("Closed-form solution found:", solution)
+    
+
+    exit()
+
 class Universal(Model):
     def __init__(self, formula):
         self.formula = formula
@@ -231,6 +326,7 @@ class Universal(Model):
         self.optimize = [{"tokens" : s} for s in statements if s.data == 'optimize']
         self.priors = [{"tokens" : s} for s in statements if s.data == 'prior']
         self.OLS = {}
+        self.EM = []
 
         # Process parameter definitions (should come first)
         self.parameters = {}
@@ -261,6 +357,10 @@ class Universal(Model):
                     else: # Set to a constant value. A sum can flatten to multiple token types, thus match anything
                         self.parameters[name]["tokens"] = rhs
                         # print(f"Parameter '{name}' initialized to {ModelFormulaReconstructor.reconstruct(copy.deepcopy(rhs))}.")
+
+                if name == "model.z":
+                    print("Latent variable 'z' detected.")
+                    self.parameters[name]["isLatent"] = True
 
                     
         # Process constraints (order independent)
@@ -310,210 +410,159 @@ class Universal(Model):
 
         # Process formulas (insert parameters and split into assignments and optimizations)
         for i, formula in enumerate(self.formulas):
-            lhs, rhs = formula["tokens"].children
-
-            if rhs.data == "funccall" and isDistributionFunction(rhs.children[0].value):
-                rhsIsProbabilistic = True
-            else:
-                rhsIsProbabilistic = False
+            lhs, rhs = convertToProbabilisticFormula(formula["tokens"]).children
 
             dependingVariables = GetVariables().transform(lhs)
             for var in dependingVariables:
                 if "." in var:
                     raise ValueError(f"LHS of a formula must not contain namespaces.")
+
+            lhsParameters = GetParameterNames().transform(lhs)
+            if len(lhsParameters) != 0:
+                raise ValueError(f"Left-hand side of the assignment must not contain parameters. Found: {', '.join(lhsParameters)}.")
+                
+            if lhs.data != "array":
+                raise ValueError(f"LHS of a formula must be an array of variables. Found: {lhs.data}.")
                 
             # Name unnamed parameters
             parameters = GetParameterNames().transform(rhs)
             rhs = NameUnnamedParameters(parameters).transform(rhs)
-
-            # If no parameters found, auto insert them in the top level sum
-            if not rhsIsProbabilistic:               
-                parameters = GetParameterNames().transform(rhs)
-
-                if len(parameters) == 0: # No parameters found, automatic mode
-                    LabelOuterSum().visit(rhs)
-                    rhs = InsertParameters().transform(rhs)
-                    parameters = GetParameterNames().transform(rhs)
-                    if len(parameters) == 0:
-                        raise ValueError("No parameters found in the formula. Please ensure the formula is correctly specified.")
-                    if len(set(parameters)) != len(parameters):
-                        raise ValueError("Duplicate parameters found in the formula. Please ensure each parameter is unique.")
             
+            distributionName = rhs.children[0].value
+            if distributionName == "normal":
+                args = rhs.children[1].children
+                if len(args) != 2:
+                    raise ValueError(f"Normal distribution must have exactly two arguments: mean and standard deviation. Found: {len(args)} arguments.")
+
+                lhsAssignment, rhsAssignment = isolateLHS(lhs, rhs, dataShape.keys(), self.modelName)
+                assignmentTokens = Tree(Token("RULE", "assignment"), [lhsAssignment, rhsAssignment])
+                self.assignments.append({
+                    "tokens": assignmentTokens
+                })
             
-            # Split the formula in an assignment and an optimization function
-            if rhsIsProbabilistic:
-                distributionName = rhs.children[0].value
-                if distributionName == "normal":
-                    args = rhs.children[1].children
-                    if len(args) != 2:
-                        raise ValueError(f"Normal distribution must have exactly two arguments: mean and standard deviation. Found: {len(args)} arguments.")
-
-                    lhs = lhs.children[0] # TODO: Change this when the formula parser supports multiple left-hand sides
-
-                    ### Copy from bellow
-
-                    if lhs.data != "variable": # like a diff(y) ~ normal(...)
-                        lhsParameters = GetParameterNames().transform(lhs)
-                        if len(lhsParameters) != 0:
-                            raise ValueError(f"Left-hand side of the assignment must not contain parameters. Found: {', '.join(lhsParameters)}.")
-                        lhsVariables = GetVariables().transform(lhs)
-                        if len(set(lhsVariables)) != 1:
-                            raise ValueError(f"Left-hand side of the assignment must contain exactly one variable. Found: {', '.join(lhsVariables)}.")
-
-                        if lhs.data == "funccall" and lhs.children[0].value == "diff":
-                            lhsInterated = lhs.children[1].children[0]
-
-                            # lhs will be on the rhs, so remove the namespace and add it again based on data columns available
-                            #constantTerm = copy.deepcopy(lhs)
-                            #constantTerm.children[0].value = constantTerm.children[0].value.replace("model.", "") # TODO
-                            constantTerm = Tree(Token('RULE', 'variable'), [Token('VALUENAME', lhsInterated.children[0].value)])
-                            constantTerm = AddNamespace(dataColumns = dataShape.keys(), modelNamespace = self.modelName).transform(constantTerm)
-
-                            rhsAssignment = Tree(Token("RULE", "sum"), [
-                                Tree(Token("RULE", "funccall"), [
-                                    Token("FUNCNAME", "lag"),
-                                    Tree(Token("RULE", "arguments"), [constantTerm])
-                                ]),
-                                Tree("operator", [
-                                    Token("SUMOPERATOR", "+")
-                                ]),
-                                copy.deepcopy(rhs)
-                            ])
-                        else:
-                            raise ValueError(f"Left-hand side of the assignment must be a variable or a diff. Found: {lhs.data}.")
-                    else:
-                        lhsInterated = copy.deepcopy(lhs)
-                        rhsAssignment = copy.deepcopy(rhs)
-
-                    ###
-
-
-
-                    tokens = Tree(Token("RULE", "assignment"), [lhsInterated, rhsAssignment])
-                    self.assignments.append({
-                        "tokens": tokens
-                    })
-                    
-                    # meanReconstructed = ModelFormulaReconstructor.reconstruct(copy.deepcopy(args[0]))
-                    # stdReconstructed = ModelFormulaReconstructor.reconstruct(copy.deepcopy(args[1]))
-                    # tokens = getParser("optimize").parse(
-                    #     "maximize: norm.logpdf(" + lhsReconstructed + ", " + meanReconstructed + ", " + stdReconstructed + ")"
-                    # )
-
-                    # Untested code: TODO
-
-                    lhsData = AddNamespace(dataColumns = dataShape.keys(), modelNamespace = self.modelName).transform(lhs)
-                    args = rhs.children[1].children
-                    rhsMean = args[0]
-                    rhsStd = args[1]
-
-                    tokens = Tree(Token("RULE", "optimize"), [
-                        Token("OPTIMIZETYPE", "maximize"),
-                        Tree(Token("RULE", "funccall"), [
-                            Token("FUNCNAME", "norm.logpdf"),
-                            Tree(Token("RULE", "arguments"), [
-                                lhsData,
-                                rhsMean,
-                                rhsStd
-                            ])
-                        ])
-                    ])
-                    self.optimize.append({"tokens": tokens})
-                else:
-                    raise ValueError(f"Unsupported distribution '{distributionName}' in the formula. Supported distributions are: normal, uniform, poisson, binomial, exponential, gamma, beta, cauchy, laplace, lognormal.")
-            else:
-                lhs = lhs.children[0] # TODO: Change this when the formula parser supports multiple left-hand sides
-
-                ### Copy from bellow
-
-                if lhs.data != "variable":
-                    lhsParameters = GetParameterNames().transform(lhs)
-                    if len(lhsParameters) != 0:
-                        raise ValueError(f"Left-hand side of the assignment must not contain parameters. Found: {', '.join(lhsParameters)}.")
-                    lhsVariables = GetVariables().transform(lhs)
-                    if len(set(lhsVariables)) != 1:
-                        raise ValueError(f"Left-hand side of the assignment must contain exactly one variable. Found: {', '.join(lhsVariables)}.")
-
-                    if lhs.data == "funccall" and lhs.children[0].value == "diff":
-                        lhs = lhs.children[1].children[0]
-
-                        # lhs will be on the rhs, so remove the namespace and add it again based on data columns available
-                        #constantTerm = copy.deepcopy(lhs)
-                        #constantTerm.children[0].value = constantTerm.children[0].value.replace("model.", "") # TODO
-                        constantTerm = Tree(Token('RULE', 'variable'), [Token('VALUENAME', lhs.children[0].value)])
-                        constantTerm = AddNamespace(dataColumns = dataShape.keys(), modelNamespace = self.modelName).transform(constantTerm)
-
-                        rhs = Tree(Token("RULE", "sum"), [
-                            Tree(Token("RULE", "funccall"), [
-                                Token("FUNCNAME", "lag"),
-                                Tree(Token("RULE", "arguments"), [constantTerm])
-                            ]),
-                            Tree("operator", [
-                                Token("SUMOPERATOR", "+")
-                            ]),
-                            copy.deepcopy(rhs)
-                        ])
-                    else:
-                        raise ValueError(f"Left-hand side of the assignment must be a variable or a diff. Found: {lhs.data}.")
-
-
-                ###
-
-                dependingVariables = GetVariables().transform(lhs)
-                if len(dependingVariables) != 1:
-                    raise ValueError(f"Left-hand side of the formula must contain exactly one variable. Found: {', '.join(dependingVariables)}.")
-                dependingVariable = dependingVariables[0]
-
-                lhsModel = AddNamespace(dataColumns = [], modelNamespace = self.modelName).transform(lhs)
                 lhsData = AddNamespace(dataColumns = dataShape.keys(), modelNamespace = self.modelName).transform(lhs)
-                rhs = AddNamespace(dataColumns = dataShape.keys(), modelNamespace = self.modelName).transform(rhs)
-                
-                rhs = ExpandFunctions().transform(rhs)
-                SetLeafNodeLags().visit(rhs)
-                
-                rhs = LabelDataDependencies().transform(rhs)
+                args = rhs.children[1].children
+                rhsMean = args[0]
+                rhsStd = args[1]
 
-                tokens = Tree(Token("RULE", "assignment"), [lhsModel, rhs])
-                self.assignments.append({"tokens": tokens})
-
-                if rhs.meta.dataDependency in ["linearTerm", "linearSum", "linearSumAndConstant"]:
-                    # TODO: move this to a separate function
-                    OLSTermsGetter = GetOLSTerms(dataShape)
-                    OLSTermsGetter.visit(rhs)
-                    self.OLS[dependingVariable] = {
-                        "terms": OLSTermsGetter.terms,
-                        "bias": OLSTermsGetter.bias,
-                        "biasIsPositive": OLSTermsGetter.biasIsPositive,
-                        "constants": OLSTermsGetter.constants
-                    }
-
-                    for term in self.OLS[dependingVariable]["terms"]:
-                        print(f"    OLS term: {term} * {ModelFormulaReconstructor.reconstruct(copy.deepcopy(self.OLS[dependingVariable]['terms'][term]))}")
-                    if self.OLS[dependingVariable]["bias"] is not None:
-                        print(f"    OLS bias: {self.OLS[dependingVariable]['bias']}")
-                    for constant in self.OLS[dependingVariable]["constants"]:
-                        print(f"    OLS constant: {ModelFormulaReconstructor.reconstruct(copy.deepcopy(constant))}")
+                loss = Tree(Token("RULE", "funccall"), [
+                    Token("FUNCNAME", "norm.logpdf"),
+                    Tree(Token("RULE", "arguments"), [
+                        lhsData,
+                        rhsMean,
+                        rhsStd
+                    ])
+                ])
 
                 tokens = Tree(Token("RULE", "optimize"), [
                     Token("OPTIMIZETYPE", "maximize"),
-                    Tree(Token("RULE", "funccall"), [
-                        Token("FUNCNAME", "norm.logpdf"),
-                        Tree(Token("RULE", "arguments"), [
-                            lhsModel,
-                            lhsData,
-                            Tree(Token("RULE", "parameter"), [
-                                Token("VALUENAME", "model.sigma_" + dependingVariable)
-                            ])
-                        ])
-                    ])
+                    loss
                 ])
                 self.optimize.append({"tokens": tokens})
 
-                self.parameterizations["model.sigma_" + dependingVariable] = {
-                    "unconstraintParameterNames": ["model.sigma_" + dependingVariable],
-                    "apply": lambda p, v = 0: jnp.exp(p),
-                    "inverse": lambda p, v = 0: jnp.log(p)
-                }
+                searchClosedFormSolution(loss)
+
+                # self.EM.append({
+                #     "variable": lhsData,
+                #     "mean": rhsMean,
+                #     "std": rhsStd
+                # })
+            else:
+                raise ValueError(f"Unsupported distribution '{distributionName}' in the formula. Supported distributions are: normal, uniform, poisson, binomial, exponential, gamma, beta, cauchy, laplace, lognormal.")
+            
+            # else:
+            #     lhs = lhs.children[0] # TODO: Change this when the formula parser supports multiple left-hand sides
+
+            #     ### Copy from bellow
+
+            #     if lhs.data != "variable":
+            #         lhsParameters = GetParameterNames().transform(lhs)
+            #         if len(lhsParameters) != 0:
+            #             raise ValueError(f"Left-hand side of the assignment must not contain parameters. Found: {', '.join(lhsParameters)}.")
+            #         lhsVariables = GetVariables().transform(lhs)
+            #         if len(set(lhsVariables)) != 1:
+            #             raise ValueError(f"Left-hand side of the assignment must contain exactly one variable. Found: {', '.join(lhsVariables)}.")
+
+            #         if lhs.data == "funccall" and lhs.children[0].value == "diff":
+            #             lhs = lhs.children[1].children[0]
+
+            #             # lhs will be on the rhs, so remove the namespace and add it again based on data columns available
+            #             #constantTerm = copy.deepcopy(lhs)
+            #             #constantTerm.children[0].value = constantTerm.children[0].value.replace("model.", "") # TODO
+            #             constantTerm = Tree(Token('RULE', 'variable'), [Token('VALUENAME', lhs.children[0].value)])
+            #             constantTerm = AddNamespace(dataColumns = dataShape.keys(), modelNamespace = self.modelName).transform(constantTerm)
+
+            #             rhs = Tree(Token("RULE", "sum"), [
+            #                 Tree(Token("RULE", "funccall"), [
+            #                     Token("FUNCNAME", "lag"),
+            #                     Tree(Token("RULE", "arguments"), [constantTerm])
+            #                 ]),
+            #                 Tree("operator", [
+            #                     Token("SUMOPERATOR", "+")
+            #                 ]),
+            #                 copy.deepcopy(rhs)
+            #             ])
+            #         else:
+            #             raise ValueError(f"Left-hand side of the assignment must be a variable or a diff. Found: {lhs.data}.")
+
+
+            #     ###
+
+            #     dependingVariables = GetVariables().transform(lhs)
+            #     if len(dependingVariables) != 1:
+            #         raise ValueError(f"Left-hand side of the formula must contain exactly one variable. Found: {', '.join(dependingVariables)}.")
+            #     dependingVariable = dependingVariables[0]
+
+            #     lhsModel = AddNamespace(dataColumns = [], modelNamespace = self.modelName).transform(lhs)
+            #     lhsData = AddNamespace(dataColumns = dataShape.keys(), modelNamespace = self.modelName).transform(lhs)
+            #     rhs = AddNamespace(dataColumns = dataShape.keys(), modelNamespace = self.modelName).transform(rhs)
+                
+            #     rhs = ExpandFunctions().transform(rhs)
+            #     SetLeafNodeLags().visit(rhs)
+                
+            #     rhs = LabelDataDependencies().transform(rhs)
+
+            #     tokens = Tree(Token("RULE", "assignment"), [lhsModel, rhs])
+            #     self.assignments.append({"tokens": tokens})
+
+            #     if rhs.meta.dataDependency in ["linearTerm", "linearSum", "linearSumAndConstant"]:
+            #         # TODO: move this to a separate function
+            #         OLSTermsGetter = GetOLSTerms(dataShape)
+            #         OLSTermsGetter.visit(rhs)
+            #         self.OLS[dependingVariable] = {
+            #             "terms": OLSTermsGetter.terms,
+            #             "bias": OLSTermsGetter.bias,
+            #             "biasIsPositive": OLSTermsGetter.biasIsPositive,
+            #             "constants": OLSTermsGetter.constants
+            #         }
+
+            #         for term in self.OLS[dependingVariable]["terms"]:
+            #             print(f"    OLS term: {term} * {ModelFormulaReconstructor.reconstruct(copy.deepcopy(self.OLS[dependingVariable]['terms'][term]))}")
+            #         if self.OLS[dependingVariable]["bias"] is not None:
+            #             print(f"    OLS bias: {self.OLS[dependingVariable]['bias']}")
+            #         for constant in self.OLS[dependingVariable]["constants"]:
+            #             print(f"    OLS constant: {ModelFormulaReconstructor.reconstruct(copy.deepcopy(constant))}")
+
+            #     tokens = Tree(Token("RULE", "optimize"), [
+            #         Token("OPTIMIZETYPE", "maximize"),
+            #         Tree(Token("RULE", "funccall"), [
+            #             Token("FUNCNAME", "norm.logpdf"),
+            #             Tree(Token("RULE", "arguments"), [
+            #                 lhsModel,
+            #                 lhsData,
+            #                 Tree(Token("RULE", "parameter"), [
+            #                     Token("VALUENAME", "model.sigma_" + dependingVariable)
+            #                 ])
+            #             ])
+            #         ])
+            #     ])
+            #     self.optimize.append({"tokens": tokens})
+
+            #     self.parameterizations["model.sigma_" + dependingVariable] = {
+            #         "unconstraintParameterNames": ["model.sigma_" + dependingVariable],
+            #         "apply": lambda p, v = 0: jnp.exp(p),
+            #         "inverse": lambda p, v = 0: jnp.log(p)
+            #     }
 
         for importedAssignment in self.importedAssignments:
             print(f"    Imported assignment: {importedAssignment['name']} = {ModelFormulaReconstructor.reconstruct(copy.deepcopy(importedAssignment['rhs']))}")
@@ -701,8 +750,8 @@ class Universal(Model):
         #     print(f"Parameterization '{parameterization}' defined with unconstraint names: {self.parameterizations[parameterization]['unconstraintParameterNames']}.")
 
         # Get global properties
-        self.leftPadding = max([assignment["leftPadding"] for assignment in self.assignments])
-        self.rightPadding = max([assignment["rightPadding"] for assignment in self.assignments])
+        self.leftPadding = max([assignment["leftPadding"] for assignment in self.assignments]) if len(self.assignments) > 0 else 0
+        self.rightPadding = max([assignment["rightPadding"] for assignment in self.assignments]) if len(self.assignments) > 0 else 0
         self.dataShape = dataShape
         # print("leftPadding:", self.leftPadding, "rightPadding:", self.rightPadding)
         # print("dataColumns:", self.dataColumns)
@@ -1105,5 +1154,67 @@ class Universal(Model):
         lastParams, lastLogPosterior, totalAcceptCount = finalCarry
 
         return lastParams, allParams, totalAcceptCount
+    
+    def EM_initialize(self):
+        for em in self.EM:
+            variable = em["variable"]
+            mean = em["mean"]
+            std = em["std"]
+
+            likelihoodTokens = Tree(Token("RULE", "funccall"), [
+                Token("FUNCNAME", "norm.logpdf"),
+                Tree(Token("RULE", "arguments"), [
+                    Tree(Token("RULE", "variable"), [
+                        Token("VARIABLENAME", variable)
+                    ]),
+                    mean,
+                    std
+                ])
+            ])
+
+            meanParams = GetParameterNames().transform(mean)
+            stdParams = GetParameterNames().transform(std)
+            allParams = set(meanParams + stdParams)
+
+            modelParams = []
+            latentParams = []
+
+            for param in allParams:
+                if "isLatent" in self.parameters[param] and self.parameters[param]["isLatent"]:
+                    latentParams.append(param)
+                else:
+                    modelParams.append(param)
+
+            priors = []
+
+            for param in latentParams:
+                if param not in self.latentParameters:
+                    raise ValueError(f"Latent parameter '{param}' not found in latent parameters. Please ensure the parameter is defined as latent.")
+                priors.append(self.latentParameters[param]["prior"])
+
+            posteriorTokens = Tree(Token("RULE", "sum"), [
+                likelihoodTokens,
+            ] + priors)
+
+            expr = LarkToSymPy().transform(posteriorTokens)
+            print("EM posterior expression for variable", variable, ":", expr)
+
+            expr = expr.expand()
+
+            z = sp.Symbol(latentParams[0])  # Currently only supports one latent parameter
+            E_expr = take_expectation(expr, z) 
+            print("EM E[posterior] expression for variable", variable, ":", E_expr)
+
+            e_terms = get_expectation_terms(E_expr, z)
+            print("E_z terms found:")
+            for term in e_terms:
+                print("     ", term)
+
+
+
+
+
+    def EM_step(self):
+        pass
 
 

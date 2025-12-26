@@ -142,6 +142,7 @@ Solvers:
 MCMC (first RWMH, later NUTS and SGMCMC)
     Metropolis-Adjusted Langevin Algorithm (MALA) (include gradient)
 VI
+EM for MAP
 EM with Kalman smoother for the E step
 EM with VI for the E step "Variational EM (VEM)"
 EM with MCMC for the E step

@@ -33,7 +33,8 @@ def test_fixed_effect():
 
     data = gd.data.Dataset(grunfeld_data)
     model = gd.models.Universal(formula)
-    model.fit(data, batchSize = 55)
+    #model.fit(data, batchSize = 55)
+    model.fit(data, optimizer = "lbfgs") # until auto closed-form solution is implemented
     model.summary(data, trueParams = trueParameters)
 
     allInConfidenceInterval = model.isAllInConfidenceInterval()

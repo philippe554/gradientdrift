@@ -7,6 +7,7 @@ from lark.visitors import Interpreter
 import jax.numpy as jnp
 from jax import lax
 import jax
+import sympy as sp
 
 from gradientdrift.utils.formulaparsers import ModelFormulaReconstructor
 from gradientdrift.utils.functionmap import getFunctionMap, requiresRandomKey
@@ -955,3 +956,189 @@ class GetOLSTerms(Interpreter):
                     self.visit(children[i])
         else:
             raise ValueError(f"Sum: Expected linear term, but found: {meta.dataDependency}")
+        
+class LarkToSymPy(Transformer):
+    """
+    Transforms a Lark AST into a SymPy expression.
+
+    This transformer assumes that:
+    1.  The `SetLeafNodeLags` visitor has already been run to propagate 
+        lag metadata (`meta.lag`) to all relevant nodes.
+    2.  The `ExpandFunctions` transformer has already run to expand
+        custom functions like `diff()` and `residuals()` into their
+        base expressions.
+    """
+    def __init__(self):
+        super().__init__()
+        # A map of function names in the formula to their SymPy equivalents
+        self.sympy_functions = {
+            # Standard math
+            'log': sp.log,
+            'exp': sp.exp,
+            'sqrt': sp.sqrt,
+            'sin': sp.sin,
+            'cos': sp.cos,
+            'tan': sp.tan,
+            'asin': sp.asin,
+            'acos': sp.acos,
+            'atan': sp.atan,
+            'abs': sp.Abs,
+            'power': sp.Pow,
+            
+            # Placeholders for domain-specific functions
+            # 'one_hot' is seen in GetOLSTerms
+            'one_hot': sp.Function('one_hot'),
+        }
+
+    def _get_symbol_name(self, qualified_name):
+        """Converts 'namespace.name' to 'namespace_name' for SymPy."""
+        return qualified_name.replace('.', '_')
+
+    @v_args(meta=True)
+    def variable(self, meta, children):
+        """
+        Transforms a 'variable' node into a SymPy Symbol.
+        Applies lag if present in meta.
+        """
+        qualified_name = children[0].value
+        symbol_name = self._get_symbol_name(qualified_name)
+        # Get the lag, defaulting to 0 if not set
+        lag = getattr(meta, 'lag', 0)
+        
+        if lag == 0:
+            return sp.Symbol(symbol_name)
+        else:
+            # Represent lag(x, L) as x_lag_L
+            return sp.Symbol(f"{symbol_name}_lag_{lag}")
+
+    @v_args(meta=True)
+    def parameter(self, meta, children):
+        """
+        Transforms a 'parameter' node into a SymPy Symbol (scalar)
+        or IndexedBase (if indexed). Applies lag if present.
+        """
+        qualified_name = children[0].value
+        symbol_name = self._get_symbol_name(qualified_name)
+        lag = getattr(meta, 'lag', 0)
+
+        if lag > 0:
+            symbol_name = f"{symbol_name}_lag_{lag}"
+
+        if len(children) == 1:
+            # Scalar parameter, e.g., 'model.beta'
+            return sp.Symbol(symbol_name)
+        elif len(children) == 2:
+            # Indexed parameter, e.g., 'model.alpha[data.group]'
+            indices = children[1]  # This is the transformed indexlist (a tuple)
+            base = sp.IndexedBase(symbol_name)
+            return base[indices]
+        else:
+            raise ValueError(f"Unexpected parameter structure: {children}")
+
+    def number(self, children):
+        """Transforms a 'number' token into a SymPy number."""
+        return sp.sympify(children[0].value)
+
+    def array(self, children):
+        """Transforms an 'array' node into a SymPy Array."""
+        if len(children) == 1:
+            return children[0]
+        else:
+            raise NotImplementedError("SymPy array transformation not implemented for multiple elements.")
+
+    def indexlist(self, children):
+        """Aggregates transformed indices into a tuple."""
+        return tuple(children)
+
+    def index(self, children):
+        """
+        Passes through the transformed index (which is already
+        a SymPy Symbol or Number).
+        """
+        return children[0]
+
+    def arguments(self, children):
+        """Passes through the list of transformed arguments for funccall."""
+        return children
+
+    def operator(self, children):
+        """Returns the appropriate Python operator function or SymPy function."""
+        op_str = children[0].value
+        if op_str == '+':
+            return op.add
+        elif op_str == '-':
+            return op.sub
+        elif op_str == '*':
+            return op.mul
+        elif op_str == '/':
+            return op.truediv
+        elif op_str == '@':
+            # Use SymPy's matrix multiplication
+            return sp.MatMul
+        else:
+            raise ValueError(f"Unknown operator: {op_str}")
+
+    def aggregate(self, children):
+        """
+        Helper function to apply a sequence of binary operators,
+        e.g., [a, +, b, -, c] -> add(a, sub(b, c)).
+        """
+        if not children:
+            return sp.Integer(0) # Neutral element for sum
+        if len(children) == 1:
+            return children[0]
+        
+        # Apply operators left-to-right
+        result = children[0]
+        for i in range(1, len(children), 2):
+            op_func = children[i]
+            right_val = children[i+1]
+            result = op_func(result, right_val)
+        return result
+
+    def sum(self, children):
+        """Transforms a 'sum' node by aggregating its children."""
+        return self.aggregate(children)
+
+    def product(self, children):
+        """Transforms a 'product' node by aggregating its children."""
+        return self.aggregate(children)
+
+    def exponent(self, children):
+        """Transforms an exponentiation node (base, exp)."""
+        if len(children) != 2:
+            raise ValueError(f"Exponentiation requires 2 children (base, exp), got {len(children)}")
+        base = children[0]
+        exponent = children[1]
+        return op.pow(base, exponent)
+
+    @v_args(inline=True)
+    def funccall(self, name, args=None):
+        """
+        Transforms a 'funccall' node into a SymPy function call.
+        """
+        name_str = str(name)
+        arg_list = args if args is not None else []
+
+        if name_str.endswith('logpdf'):
+            # norm.logpdf(x, loc=0, scale=1)
+            x = arg_list[0]
+            loc = arg_list[1] if len(arg_list) > 1 else 0
+            scale = arg_list[2] if len(arg_list) > 2 else 1
+            
+            # SymPy constants
+            log = sp.log
+            pi = sp.pi
+            
+            # Formula: -log(scale) - 0.5*log(2*pi) - 0.5*((x - loc)/scale)**2
+            z = (x - loc) / scale
+            return -log(scale) - sp.Rational(1, 2) * log(2 * pi) - sp.Rational(1, 2) * z**2
+        
+
+        # Look up the function in our SymPy map
+        if name_str in self.sympy_functions:
+            return self.sympy_functions[name_str](*arg_list)
+        else:
+            # If not found, create a generic, uninterpreted SymPy function.
+            # This allows for custom functions not in the map.
+            return sp.Function(name_str)(*arg_list)
